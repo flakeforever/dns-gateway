@@ -1,5 +1,5 @@
 # DNS Gateway
-
+![DNS Gateway]https://github.com/flakeforever/dns-gateway/blob/main/dns-gateway.png
 DNS Gateway is a lightweight, efficient, and reliable recursive DNS gateway. It is built on top of asio and openssl libraries and utilizes multi-threading and C++20 coroutine mechanisms to provide excellent concurrency and scalability.
 
 ## Key Features

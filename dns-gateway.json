@@ -1,0 +1,73 @@
+{
+  "max_pools": 2,
+  "max_cache": 1000,
+  "listen_address": "127.0.0.1",
+  "listen_port": 5053,
+  "log_level": "debug",
+  "groups": [
+    {
+      "name": "local-service",
+      "upstreams": [
+        {
+          "uri": "udp://1.1.1.1"
+        },
+        {
+          "uri": "udp://8.8.8.8"
+        }
+      ]
+    },
+    {
+      "name": "security",
+      "default": true,
+      "upstreams": [
+        {
+          "uri": "doh://1.1.1.1/dns-query",
+          "proxy": "socks5://192.168.88.1:1080",
+          "keep_alive": true,
+          "check_enabled": true,
+          "check_interval": 90
+        },
+        {
+          "uri": "doh://8.8.8.8/dns-query",
+          "proxy": "socks5://192.168.88.1:1080",
+          "keep_alive": true,
+          "check_enabled": true,
+          "check_interval": 90
+        }
+      ]
+    }
+  ],
+  "routes": [
+    {
+      "rules": [
+        {
+          "file": "non-security-list.txt",
+          "group": "local-service"
+        }
+      ],
+      "statics": [
+        {
+          "domain": "api.example.com",
+          "type": "A",
+          "value": "192.168.0.1"
+        },
+        {
+          "domain": "api.example.com",
+          "type": "AAAA",
+          "value": "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+        },
+        {
+          "domain": "example.com",
+          "type": "TXT",
+          "value": "This is a test result for DNS static routing."
+        },
+        {
+          "domain": "example.com",
+          "type": "TXT",
+          "value": "This is a multi-entry test for the same type."
+        }
+      ]
+    }
+  ],
+  "check_domains": "www.google.com"
+}

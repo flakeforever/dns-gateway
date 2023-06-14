@@ -1,0 +1,20 @@
+[submodule "lib/asio"]
+	path = lib/asio
+	url = https://github.com/chriskohlhoff/asio.git
+	branch = master
+[submodule "lib/openssl"]
+	path = lib/openssl
+	url = https://github.com/openssl/openssl.git
+	branch = OpenSSL_1_1_1-stable
+[submodule "CxxUrl"]
+	path = CxxUrl
+	url = https://github.com/chmike/CxxUrl.git
+	branch = master
+[submodule "lib/CxxUrl"]
+	path = lib/CxxUrl
+	url = https://github.com/chmike/CxxUrl.git
+	branch = master
+[submodule "lib/picojson"]
+	path = lib/picojson
+	url = https://github.com/kazuho/picojson.git
+	branch = master

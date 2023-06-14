@@ -19,8 +19,8 @@
 #include <asio/signal_set.hpp>
 #include "lib/picojson/picojson.h"
 #include "lib/CxxUrl/url.hpp"
-#include "dns_gateway.hpp"
-#include "dns_log.hpp"
+#include "dns/dns_gateway.hpp"
+#include "dns/dns_log.hpp"
 #include "config.hpp"
 #include "version.hpp"
 

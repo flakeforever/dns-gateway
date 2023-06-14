@@ -14,7 +14,7 @@
 #pragma once
 
 #include <asio.hpp>
-#include "socks_client.hpp"
+#include "socks/socks_client.hpp"
 #include "dns_error.hpp"
 #include "operation.hpp"
 #include "property.hpp"

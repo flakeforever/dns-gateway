@@ -22,7 +22,14 @@ add_custom_command(
 add_custom_target(openssl DEPENDS build_openssl)
 
 set(SOURCES
+    lib/CxxUrl/url.cpp
+
     config.cpp
+    main.cpp  
+)
+
+set(DNS_SOURCES
+    operation.cpp
 
     dns_buffer.cpp
     dns_cache.cpp
@@ -32,19 +39,22 @@ set(SOURCES
     dns_package.cpp
     dns_router.cpp
     dns_upstream.cpp
+)
 
-    main.cpp
-    operation.cpp
-
+set(SOCKS_SOURCES
     socks_buffer.cpp
     socks_client.cpp
     socks_common.cpp
     socks_error.cpp
-    
-    lib/CxxUrl/url.cpp
 )
 
-add_executable(dns-gateway ${SOURCES})
+list(TRANSFORM SOCKS_SOURCES PREPEND "dns/socks/")
+list(APPEND SOURCES ${SOCKS_SOURCES})
+
+list(TRANSFORM DNS_SOURCES PREPEND "dns/")
+list(APPEND SOURCES ${DNS_SOURCES})
+
+add_executable(dns-gateway ${SOURCES} ${DNS_SOURCES} ${SOCKS_SOURCES})
 
 # include asio
 include_directories(lib/asio/asio/include)

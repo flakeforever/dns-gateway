@@ -14,7 +14,7 @@
 #include "dns_upstream.hpp"
 #include "dns_log.hpp"
 #include "base64.hpp"
-#include "lib/CxxUrl/url.hpp"
+#include "./../lib/CxxUrl/url.hpp"
 
 using asio::awaitable;
 

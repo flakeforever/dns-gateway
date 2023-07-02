@@ -1,9 +1,11 @@
 {
-  "max_pools": 2,
-  "max_cache": 1000,
+  "max_works": 1,
+  "min_pools": 5,
+  "max_pools": 50,
+  "max_cache": 100,
   "listen_address": "127.0.0.1",
-  "listen_port": 5053,
-  "log_level": "debug",
+  "listen_port": 53,
+  "log_level": "info",
   "groups": [
     {
       "name": "local-service",

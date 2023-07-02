@@ -58,8 +58,11 @@ namespace config
     class dns_config
     {
     public:
+        int max_works;
+        int min_pools;
         int max_pools;
         int max_cache;
+        std::string protocol;
         std::string listen_address;
         int listen_port;
         std::string log_level;

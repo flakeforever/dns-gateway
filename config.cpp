@@ -46,20 +46,32 @@ namespace config
         }
 
         picojson::object &obj = json.get<picojson::object>();
+        if (obj.find("max_works") != obj.end() && obj["max_works"].is<double>())
+        {
+            config.max_works = static_cast<int>(obj["max_works"].get<double>());
+
+            if (config.max_works <= 0)
+            {
+                std::cout << "Invalid config format: max_works cannot be set to \""
+                          << config.max_works << "\"." << std::endl;
+                return false;
+            }
+        }
+        if (obj.find("min_pools") != obj.end() && obj["min_pools"].is<double>())
+        {
+            config.min_pools = static_cast<int>(obj["min_pools"].get<double>());
+        }
         if (obj.find("max_pools") != obj.end() && obj["max_pools"].is<double>())
         {
             config.max_pools = static_cast<int>(obj["max_pools"].get<double>());
-
-            if (config.max_pools <= 0)
-            {
-                std::cout << "Invalid config format: max_pools cannot be set to \""
-                          << config.max_pools << "\"." << std::endl;
-                return false;
-            }
         }
         if (obj.find("max_cache") != obj.end() && obj["max_cache"].is<double>())
         {
             config.max_cache = static_cast<int>(obj["max_cache"].get<double>());
+        }
+        if (obj.find("protocol") != obj.end() && obj["protocol"].is<std::string>())
+        {
+            config.protocol = obj["protocol"].get<std::string>();
         }
         if (obj.find("listen_address") != obj.end() && obj["listen_address"].is<std::string>())
         {

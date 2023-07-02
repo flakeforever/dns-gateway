@@ -90,7 +90,20 @@ bool parse_arguments(int argc, char *argv[])
 
 void print_config(const config::dns_config &config)
 {
+    std::cout << "max_works: " << config.max_works << std::endl;
+    std::cout << "min_pools: " << config.min_pools << std::endl;
     std::cout << "max_pools: " << config.max_pools << std::endl;
+    std::cout << "max_cache: " << config.max_cache << std::endl;
+
+    if (config.listen_address != "")
+    {
+        std::cout << "listen_address: " << config.listen_address << std::endl;
+    }
+    else if (config.protocol != "")
+    {
+        std::cout << "protocol: " << config.protocol << std::endl;
+    }
+
     std::cout << "listen_port: " << config.listen_port << std::endl;
 
     std::cout << "groups: " << std::endl;
@@ -157,6 +170,10 @@ void init_logger(dns::dns_logger &logger, config::dns_config config)
     {
         logger.level(dns::log_level::debug);
     }
+    else
+    {
+        logger.level(dns::log_level::error);
+    }
 }
 
 bool load_route(dns::dns_router &router, const std::string &file_name, const std::string &group_name)
@@ -187,18 +204,42 @@ bool load_route(dns::dns_router &router, const std::string &file_name, const std
     return true;
 }
 
-asio::awaitable<bool> init_gateway(dns::dns_gateway &gateway, config::dns_config config)
+dns::dns_gateway *create_gateway(asio::any_io_executor executor, config::dns_config config)
 {
-    dns::dns_router &router = gateway.get_router();
+    if (config.listen_address == "")
+    {
+        if (config.protocol == "ipv4")
+        {
+            return new dns::dns_gateway(executor, asio::ip::udp::v4(),
+                                        config.listen_port, config.min_pools, config.max_pools);
+        }
+        else if (config.protocol == "ipv6")
+        {
+            return new dns::dns_gateway(executor, asio::ip::udp::v6(),
+                                        config.listen_port, config.min_pools, config.max_pools);
+        }
+    }
+    else
+    {
+        return new dns::dns_gateway(executor, config.listen_address,
+                                    config.listen_port, config.min_pools, config.max_pools);
+    }
 
-    if (!gateway.get_cache().init_cache(config.max_cache))
+    return nullptr;
+}
+
+asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway, config::dns_config config)
+{
+    dns::dns_router &router = gateway->get_router();
+
+    if (!gateway->get_cache().init_cache(config.max_cache))
     {
         co_return false;
     }
 
     for (const auto &domain : config.check_domains)
     {
-        gateway.check_domains.push_back(domain);
+        gateway->check_domains.push_back(domain);
     }
 
     for (const auto &group : config.groups)
@@ -234,7 +275,7 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway &gateway, config::dns_config
                 }
 
                 std::shared_ptr<dns::dns_udp_upstream> udp_upstream =
-                    std::make_shared<dns::dns_udp_upstream>(gateway.get_executor(), uri.host(), port);
+                    std::make_shared<dns::dns_udp_upstream>(gateway->get_executor(), uri.host(), port);
 
                 if (upstream.proxy != "")
                 {
@@ -251,12 +292,12 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway &gateway, config::dns_config
 
                 // co_await udp_upstream->associate();
                 upstream_group->add_upstream(udp_upstream);
-                gateway.upstreams_.push_back(udp_upstream);
+                gateway->upstreams_.push_back(udp_upstream);
             }
             else if (uri.scheme() == "doh")
             {
                 std::shared_ptr<dns::dns_https_upstream> https_upstream =
-                    std::make_shared<dns::dns_https_upstream>(gateway.get_executor(), upstream.uri);
+                    std::make_shared<dns::dns_https_upstream>(gateway->get_executor(), upstream.uri);
 
                 if (upstream.proxy != "")
                 {
@@ -274,7 +315,7 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway &gateway, config::dns_config
 
                 // co_await https_upstream->connect();
                 upstream_group->add_upstream(https_upstream);
-                gateway.upstreams_.push_back(https_upstream);
+                gateway->upstreams_.push_back(https_upstream);
             }
         }
     }
@@ -283,28 +324,28 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway &gateway, config::dns_config
     {
         for (const auto &rule : route.rules)
         {
-            load_route(gateway.get_router(), rule.file, rule.group);
+            load_route(gateway->get_router(), rule.file, rule.group);
         }
         for (const auto &static_entry : route.statics)
         {
             if (static_entry.type == "A")
             {
-                gateway.get_router().get_statics().add_static_value(
+                gateway->get_router().get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::a, static_entry.value);
             }
             if (static_entry.type == "AAAA")
             {
-                gateway.get_router().get_statics().add_static_value(
+                gateway->get_router().get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::aaaa, static_entry.value);
             }
             if (static_entry.type == "CNAME")
             {
-                gateway.get_router().get_statics().add_static_value(
+                gateway->get_router().get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::cname, static_entry.value);
             }
             if (static_entry.type == "TXT")
             {
-                gateway.get_router().get_statics().add_static_value(
+                gateway->get_router().get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::txt, static_entry.value);
             }
         }
@@ -336,9 +377,9 @@ int main(int argc, char *argv[])
 
         init_logger(dns::logger, config);
 
-        asio::thread_pool thread_pool(config.max_pools);
-        dns::dns_gateway gateway(thread_pool.get_executor(), config.listen_address, config.listen_port, config.max_pools);
+        asio::thread_pool thread_pool(config.max_works);
         asio::signal_set signals(thread_pool.get_executor(), SIGINT, SIGTERM);
+        dns::dns_gateway *gateway = create_gateway(thread_pool.get_executor(), config);
 
         // set signals
         co_spawn(
@@ -347,13 +388,14 @@ int main(int argc, char *argv[])
             {
                 co_await signals.async_wait(asio::use_awaitable);
 
-                gateway.active(false);
-                co_await gateway.wait_terminated();
+                gateway->active(false);
+                co_await gateway->wait_terminated();
 
                 thread_pool.stop();
             },
             detached);
 
+        // handle process
         auto handle_process = [&]() -> asio::awaitable<void>
         {
             bool status = co_await init_gateway(gateway, config);
@@ -362,8 +404,8 @@ int main(int argc, char *argv[])
             {
                 dns::logger.info("dns-gateway is running.");
 
-                gateway.active(true);
-                co_await gateway.run_process();
+                gateway->active(true);
+                co_await gateway->run_process();
             }
             else
             {

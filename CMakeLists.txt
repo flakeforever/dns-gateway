@@ -60,6 +60,8 @@ add_executable(dns-gateway ${SOURCES} ${DNS_SOURCES} ${SOCKS_SOURCES})
 include_directories(lib/asio/asio/include)
 # include openssl
 include_directories(lib/openssl/include)
+# include dbslib
+include_directories(lib/dnslib/src)
 
 # depend openssl
 add_dependencies(dns-gateway openssl)

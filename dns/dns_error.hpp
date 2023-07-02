@@ -29,6 +29,8 @@ namespace dns
             request_failed,
             request_timeout,
             buffer_not_enough,
+            buffer_format_error,
+            buffer_out_of_range,
             http_header_invalid,
             http_data_error,
         };

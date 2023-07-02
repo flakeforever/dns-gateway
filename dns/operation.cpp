@@ -13,6 +13,10 @@
 
 #include "operation.hpp"
 
+semaphore_object::semaphore_object()
+{
+}
+
 semaphore::semaphore()
 {
 }
@@ -28,24 +32,31 @@ std::shared_ptr<semaphore_object> semaphore::get_object()
     std::unique_lock<std::mutex> lock(mutex_);
     condition_.wait(lock, [this]
                     { return !objects_.empty(); });
+
     auto obj = objects_.back();
     objects_.pop_back();
+
     return obj;
 }
 
 void semaphore::notify(std::shared_ptr<semaphore_object> obj)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    objects_.push_back(obj);
+    // obj->cancel_timer(); // Cancel the timer for the object
+    // obj->print_elapsed_time(); // Print the elapsed time
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        objects_.push_back(obj);
+    }
+
     condition_.notify_one();
 }
 
-async_wait::async_wait(asio::any_io_executor executor)
+await_wait::await_wait(asio::any_io_executor executor)
     : timer_(executor)
 {
 }
 
-asio::awaitable<void> async_wait::wait_until(std::chrono::milliseconds duration, std::function<void(bool &)> callback)
+asio::awaitable<void> await_wait::wait_until(std::chrono::milliseconds duration, std::function<void(bool &)> callback)
 {
     bool finished = false;
     while (!finished)
@@ -55,7 +66,7 @@ asio::awaitable<void> async_wait::wait_until(std::chrono::milliseconds duration,
     }
 }
 
-asio::awaitable<void> async_wait::wait_until(std::chrono::milliseconds duration, std::function<asio::awaitable<void>(bool &)> callback)
+asio::awaitable<void> await_wait::wait_until(std::chrono::milliseconds duration, std::function<asio::awaitable<void>(bool &)> callback)
 {
     bool finished = false;
     while (!finished)
@@ -65,7 +76,7 @@ asio::awaitable<void> async_wait::wait_until(std::chrono::milliseconds duration,
     }
 }
 
-asio::awaitable<void> async_wait::wait(std::chrono::milliseconds duration)
+asio::awaitable<void> await_wait::wait(std::chrono::milliseconds duration)
 {
     auto now = std::chrono::steady_clock::now();
     auto deadline = now + duration;
@@ -74,13 +85,18 @@ asio::awaitable<void> async_wait::wait(std::chrono::milliseconds duration)
     co_await timer_.async_wait(asio::use_awaitable);
 }
 
-async_execute::async_execute(asio::any_io_executor executor)
-    : timer_(executor)
+await_lock::await_lock(asio::any_io_executor executor, std::mutex &mutex)
+    : timer_(executor), lock_(mutex, std::try_to_lock)
 {
 }
 
-asio::awaitable<void> async_execute::execute_until(std::chrono::milliseconds duration,
-                                                   std::function<asio::awaitable<void>(asio::steady_timer &)> callback)
+await_timeout_execute::await_timeout_execute(asio::any_io_executor executor)
+    : timeout_(false), timer_(executor)
+{
+}
+
+asio::awaitable<void> await_timeout_execute::execute_until(
+    std::chrono::milliseconds duration, std::function<asio::awaitable<void>(asio::steady_timer &)> callback)
 {
     try
     {
@@ -93,21 +109,20 @@ asio::awaitable<void> async_execute::execute_until(std::chrono::milliseconds dur
         */
         co_await (check_timeout(duration) && callback(timer_));
     }
-    catch (const std::system_error &e)
+    catch (const std::exception &e)
     {
         // ignore all system errors
-        // std::cerr << "execute_until error: " << e.code().value() << " message: " << e.what() << '\n';
     }
 
     co_return;
 }
 
-bool async_execute::timeout() const
+bool await_timeout_execute::timeout() const
 {
     return timeout_;
 }
 
-asio::awaitable<void> async_execute::check_timeout(std::chrono::milliseconds duration)
+asio::awaitable<void> await_timeout_execute::check_timeout(std::chrono::milliseconds duration)
 {
     try
     {

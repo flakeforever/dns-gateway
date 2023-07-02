@@ -21,10 +21,12 @@
 
 namespace dns
 {
+    constexpr int buffer_size = 1024;
+    constexpr int max_label_size = 63;
+
     class dns_buffer_property
     {
     public:
-        PROPERTY_READONLY(size_t, capacity);
         PROPERTY_READWRITE(size_t, position);
         PROPERTY_READONLY(size_t, size);
     };
@@ -32,33 +34,31 @@ namespace dns
     class dns_buffer : public dns_buffer_property
     {
     public:
-        dns_buffer(size_t initial_capacity = 0);
+        dns_buffer(uint8_t *buffer, int buffer_size);
         ~dns_buffer();
 
         void clear();
-        void reserve(size_t new_capacity);
-        void resize(size_t new_size);
 
         void write_8bits(uint8_t value);
         void write_16bits(uint16_t value);
         void write_32bits(uint32_t value);
         void write_buffer(const char *buffer, size_t length);
-        size_t calculate_domain_size(const std::string &domain) const;
-        void write_domain(const std::string &domain);
-        void write_text(const std::string& str);
+        void write_domain(const std::string domain);
+        void write_text(const std::string text);
 
         uint8_t read_8bits();
         uint16_t read_16bits();
         uint32_t read_32bits();
-        bool read_buffer(char *buffer, size_t length);
+        void read_buffer(char *buffer, size_t length);
         std::string read_domain();
         std::string read_text();
 
-        uint8_t *data() const;
-
     private:
-        uint8_t *data_;
-        char name_buffer_[256];
+        void assert_buffer(size_t operation_size);
+        uint16_t get_label_ptr(const std::string label);
+
+        uint8_t *buffer_;
+        size_t buffer_size_;
         std::map<std::string, uint16_t> label_map_;
     };
 }

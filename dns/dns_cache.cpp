@@ -16,9 +16,9 @@
 
 namespace dns
 {
-    int get_current_time()
+    int64_t get_current_time()
     {
-        return std::chrono::duration_cast<std::chrono::seconds>(
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
             .count();
     }

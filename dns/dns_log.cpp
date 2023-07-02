@@ -15,7 +15,7 @@
 
 namespace dns
 {
-    dns_logger logger(log_level::info);
+    dns_logger logger(log_level::debug);
     
     dns_logger::dns_logger(log_level level)
     {
@@ -90,11 +90,14 @@ namespace dns
             break;
         }
 
-        std::time_t now = std::time(nullptr);
-        std::string time_str = std::ctime(&now);
-        time_str.pop_back(); // Remove trailing newline character
-
         std::cout << "[" << level_str << "] "
-                  << "[" << time_str << "] " << message << std::endl;
+                  << message << std::endl;
+
+        // std::time_t now = std::time(nullptr);
+        // std::string time_str = std::ctime(&now);
+        // time_str.pop_back(); // Remove trailing newline character
+
+        // std::cout << "[" << level_str << "] "
+        //           << "[" << time_str << "] " << message << std::endl;
     }
 }

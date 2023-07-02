@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <string>
 #include <memory>
+#include <mutex>
 #include "dns_upstream.hpp"
 #include "dns_package.hpp"
 
@@ -32,14 +33,17 @@ namespace dns
                                public std::enable_shared_from_this<dns_upstream_group>
     {
     public:
-        dns_upstream_group();
+        dns_upstream_group(asio::any_io_executor executor);
 
         void add_upstream(std::shared_ptr<dns_upstream> upstream);
-        std::shared_ptr<dns_upstream> get_next_upstream();
+        asio::awaitable<std::shared_ptr<dns_upstream>> get_next_upstream();
 
     private:
         std::vector<std::shared_ptr<dns_upstream>> upstreams_;
+        
+        asio::any_io_executor executor_;
         size_t current_index_;
+        std::mutex mutex_;
     };
 
     class dns_statics
@@ -57,6 +61,8 @@ namespace dns
     class dns_router
     {
     public:
+        dns_router(asio::any_io_executor executor);
+
         std::shared_ptr<dns_upstream_group> create_group(const std::string &name);
         std::shared_ptr<dns_upstream_group> get_group(uint8_t group_id);
         std::shared_ptr<dns_upstream_group> get_group(const std::string &name);
@@ -64,7 +70,7 @@ namespace dns
         // add a route by domain and group_id
         void add_route(const std::string &domain, uint8_t group_id);
         // get upstream group id by domain
-        uint8_t get_route(const std::string &domain);
+        asio::awaitable<uint8_t> get_route(const std::string &domain);
 
         dns_statics &get_statics();
         std::shared_ptr<dns_upstream_group> default_group;
@@ -87,6 +93,8 @@ namespace dns
         std::unordered_map<uint8_t, std::shared_ptr<dns_upstream_group>> upstream_groups_;
         uint8_t next_group_id_ = 1;
 
+        asio::any_io_executor executor_;
         dns_statics statics_;
+        std::mutex mutex_;
     };
 }

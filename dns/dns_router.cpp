@@ -12,11 +12,12 @@
 //
 
 #include "dns_router.hpp"
+#include "dns_log.hpp"
 
 namespace dns
 {
-    dns_upstream_group::dns_upstream_group()
-        : current_index_(0)
+    dns_upstream_group::dns_upstream_group(asio::any_io_executor executor)
+        : executor_(executor), current_index_(0)
     {
     }
 
@@ -25,19 +26,22 @@ namespace dns
         upstreams_.push_back(upstream);
     }
 
-    std::shared_ptr<dns_upstream> dns_upstream_group::get_next_upstream()
+    asio::awaitable<std::shared_ptr<dns_upstream>> dns_upstream_group::get_next_upstream()
     {
+        await_lock lock(executor_, mutex_);
+        co_await lock.check_lock();
+
         // Get the next upstream in a round-robin fashion
         size_t size = upstreams_.size();
         if (size > 0)
         {
             std::shared_ptr<dns_upstream> upstream = upstreams_[current_index_];
             current_index_ = (current_index_ + 1) % size; // Update the current index
-            return upstream;
+            co_return upstream;
         }
         else
         {
-            throw std::runtime_error("No upstreams available in the group.");
+            co_return nullptr;
         }
     }
 
@@ -67,9 +71,14 @@ namespace dns
         return domain + "_" + std::to_string(static_cast<int>(type));
     }
 
+    dns_router::dns_router(asio::any_io_executor executor)
+        : executor_(executor)
+    {
+    }
+
     std::shared_ptr<dns_upstream_group> dns_router::create_group(const std::string &name)
     {
-        std::shared_ptr<dns_upstream_group> group = std::make_shared<dns::dns_upstream_group>();
+        std::shared_ptr<dns_upstream_group> group = std::make_shared<dns::dns_upstream_group>(executor_);
         group->id(get_next_group_id());
         group->name(name);
         upstream_groups_[group->id()] = group;
@@ -100,9 +109,12 @@ namespace dns
         insert_to_trie(root_, domain, group_id);
     }
 
-    uint8_t dns_router::get_route(const std::string &domain)
+    asio::awaitable<uint8_t> dns_router::get_route(const std::string &domain)
     {
-        return search_in_trie(root_, domain);
+        await_lock lock(executor_, mutex_);
+        co_await lock.check_lock();
+
+        co_return search_in_trie(root_, domain);
     }
 
     dns_statics &dns_router::get_statics()

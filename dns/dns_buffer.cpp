@@ -12,294 +12,246 @@
 //
 
 #include "dns_buffer.hpp"
+#include "dns_error.hpp"
+#include "dns_log.hpp"
 #include <stack>
 #include <arpa/inet.h>
+#include <sstream>
 
 namespace dns
 {
-    dns_buffer::dns_buffer(size_t initial_capacity)
-        : data_(nullptr)
+    dns_buffer::dns_buffer(uint8_t *buffer, int buffer_size)
+        : buffer_(buffer), buffer_size_(buffer_size)
     {
         size_ = 0;
-        capacity_ = 0;
         position_ = 0;
-
-        reserve(initial_capacity);
     }
 
     dns_buffer::~dns_buffer()
     {
         clear();
-
-        if (data_)
-        {
-            delete[] data_;
-            data_ = nullptr;
-        }        
     }
 
     void dns_buffer::clear()
     {
-        resize(0);
         position(0);
         label_map_.clear();
     }
 
-    void dns_buffer::reserve(size_t new_capacity)
+    void dns_buffer::assert_buffer(size_t operation_size)
     {
-        if (new_capacity > capacity_)
+        if (position_ > buffer_size_ || position_ + operation_size > buffer_size_)
         {
-            uint8_t *new_data = new uint8_t[new_capacity];
-            if (data_)
-            {
-                std::copy(data_, data_ + size_, new_data);
-                delete[] data_;
-            }
-            data_ = new_data;
-            capacity_ = new_capacity;
-        }
-    }
-
-    void dns_buffer::resize(size_t new_size)
-    {
-        if (new_size < size_)
-        {
-            size_ = new_size;
-            position_ = std::min(position_, size_);
-        }
-        else if (new_size > size_)
-        {
-            reserve(new_size);
-            std::memset(data_ + size_, 0, new_size - size_);
-            size_ = new_size;
-            position_ = std::min(position_, size_);
+            throw std::system_error(
+                dns::errc::make_error_code(dns::errc::error_code::buffer_out_of_range));
         }
     }
 
     void dns_buffer::write_8bits(uint8_t value)
     {
-        reserve(size_ + 1);
-        data_[position_++] = static_cast<char>(value);
+        assert_buffer(sizeof(uint8_t));
+
+        buffer_[position_++] = static_cast<char>(value);
         size_ = std::max(size_, position_);
     }
 
     void dns_buffer::write_16bits(uint16_t value)
     {
-        reserve(size_ + 2);
+        assert_buffer(sizeof(uint16_t));
 
         value = htons(value);
         char *ptr = reinterpret_cast<char *>(&value);
-        std::copy(ptr, ptr + 2, data_ + position_);
+        std::copy(ptr, ptr + 2, buffer_ + position_);
         position_ += 2;
         size_ = std::max(size_, position_);
     }
 
     void dns_buffer::write_32bits(uint32_t value)
     {
-        reserve(size_ + 4);
+        assert_buffer(sizeof(uint32_t));
 
         value = htonl(value);
         char *ptr = reinterpret_cast<char *>(&value);
-        std::copy(ptr, ptr + 4, data_ + position_);
+        std::copy(ptr, ptr + 4, buffer_ + position_);
         position_ += 4;
         size_ = std::max(size_, position_);
     }
 
     void dns_buffer::write_buffer(const char *buffer, size_t length)
     {
-        reserve(size_ + length);
-        std::copy(buffer, buffer + length, data_ + position_);
+        assert_buffer(length);
+
+        std::copy(buffer, buffer + length, buffer_ + position_);
         position_ += length;
         size_ = std::max(size_, position_);
     }
 
-    // Write a domain to the buffer
-    void dns_buffer::write_domain(const std::string &domain)
+    uint16_t dns_buffer::get_label_ptr(const std::string label)
     {
-        size_t start_pos = position_;
-
-        // Split the domain into labels
-        std::string::size_type label_start = 0;
-        std::string::size_type label_end = domain.find('.');
-        std::string label;
-        bool first_label = true;
-
-        while (label_end != std::string::npos)
+        auto it = label_map_.find(label);
+        if (it != label_map_.end())
         {
-            label = domain.substr(label_start, label_end - label_start);
-
-            // Check if the label already exists in the label map
-            auto it = label_map_.find(label);
-            if (it != label_map_.end())
-            {
-                // Write a compressed pointer to the existing label
-                uint16_t offset = it->second | 0xC000;
-                write_16bits(offset);
-                return;
-            }
-
-            // Write the label length and data to the buffer
-            uint8_t label_length = static_cast<uint8_t>(label.length());
-            write_8bits(label_length);
-            write_buffer(label.c_str(), label_length);
-
-            // Add the label to the label map
-            if (!first_label)
-                label_map_[label] = start_pos;
-
-            start_pos = position_;
-
-            // Move to the next label
-            label_start = label_end + 1;
-            label_end = domain.find('.', label_start);
-            first_label = false;
+            return it->second;
         }
 
-        // Write the final label and the terminating zero
-        label = domain.substr(label_start);
-        uint8_t label_length = static_cast<uint8_t>(label.length());
-        write_8bits(label_length);
-        write_buffer(label.c_str(), label_length);
-        write_8bits(0);
-
-        // Add the label to the label map
-        if (!first_label)
-            label_map_[label] = start_pos;
+        return 0;
     }
 
-    void dns_buffer::write_text(const std::string &str)
+    // Write a domain to the buffer
+    void dns_buffer::write_domain(const std::string domain)
     {
-        write_8bits(static_cast<uint16_t>(str.length()));
-        write_buffer(str.c_str(), str.length());
+        std::string curren_label = domain;
+        std::string curren_name = domain;
+
+        uint16_t label_ptr = get_label_ptr(curren_label);
+        while (label_ptr == 0)
+        {
+            std::string sub_name = "";
+            size_t dotPos = curren_name.find('.');
+            if (dotPos != std::string::npos)
+            {
+                sub_name = curren_name.substr(0, dotPos);
+                curren_name = curren_name.substr(dotPos + 1);
+            }
+            else
+            {
+                sub_name = curren_name;
+                curren_name = "";
+            }
+
+            // write new label
+            if (sub_name == "" || sub_name.length() > dns::max_label_size)
+            {
+                throw std::system_error(
+                    dns::errc::make_error_code(dns::errc::error_code::buffer_format_error));
+            }
+
+            size_t start_pos = position_;
+            write_text(sub_name);
+
+            if (curren_name == "")
+            {
+                break;
+            }
+
+            label_map_[curren_label] = start_pos;
+            curren_label = curren_name;
+
+            label_ptr = get_label_ptr(curren_label);
+        }
+
+        if (curren_name != "" && label_ptr > 0)
+        {
+            uint16_t offset = label_ptr | 0xC000;
+            write_16bits(offset);
+        }
+        else
+        {
+            write_8bits(0);
+        }
+    }
+
+    void dns_buffer::write_text(const std::string text)
+    {
+        write_8bits(static_cast<uint16_t>(text.length()));
+        write_buffer(text.c_str(), text.length());
     }
 
     uint8_t dns_buffer::read_8bits()
     {
-        if (position_ < size_)
-        {
-            return static_cast<uint8_t>(data_[position_++]);
-        }
-        else
-        {
-            // process exception
-            return 0;
-        }
+        assert_buffer(sizeof(uint8_t));
+        return static_cast<uint8_t>(buffer_[position_++]);
     }
 
     uint16_t dns_buffer::read_16bits()
     {
-        if (position_ + 2 <= size_)
-        {
-            uint16_t value;
-            char *ptr = reinterpret_cast<char *>(&value);
-            std::copy(data_ + position_, data_ + position_ + 2, ptr);
-            position_ += 2;
-            return ntohs(value);
-        }
-        else
-        {
-            // process exception or error
-            return 0;
-        }
+        assert_buffer(sizeof(uint16_t));
+
+        uint16_t value;
+        char *ptr = reinterpret_cast<char *>(&value);
+        std::copy(buffer_ + position_, buffer_ + position_ + 2, ptr);
+        position_ += 2;
+        return ntohs(value);
     }
 
     uint32_t dns_buffer::read_32bits()
     {
-        if (position_ + 4 <= size_)
-        {
-            uint32_t value;
-            char *ptr = reinterpret_cast<char *>(&value);
-            std::copy(data_ + position_, data_ + position_ + 4, ptr);
-            position_ += 4;
-            return ntohl(value);
-        }
-        else
-        {
-            // process exception or error
-            return 0;
-        }
+        assert_buffer(sizeof(uint32_t));
+
+        uint32_t value;
+        char *ptr = reinterpret_cast<char *>(&value);
+        std::copy(buffer_ + position_, buffer_ + position_ + 4, ptr);
+        position_ += 4;
+        return ntohl(value);
     }
 
-    bool dns_buffer::read_buffer(char *buffer, size_t length)
+    void dns_buffer::read_buffer(char *buffer, size_t length)
     {
-        if (position_ + length <= size_)
-        {
-            std::copy(data_ + position_, data_ + position_ + length, buffer);
-            position_ += length;
-        }
-        else
-        {
-            return false;
-        }
+        assert_buffer(length);
 
-        return true;
+        std::copy(buffer_ + position_, buffer_ + position_ + length, buffer);
+        position_ += length;
     }
 
     // Read a domain from the buffer
     std::string dns_buffer::read_domain()
     {
-        uint8_t len;
-        int i = 0;
-        std::stack<uint16_t> pointers;
+        std::string result = "";
+        size_t current_pos = 0;
 
-        while (data_[position_] != 0)
+        uint8_t len = read_8bits();
+        while (len != 0)
         {
-            len = read_8bits();
-
-            // Check if it is an offset of a previously appeared name
-            if ((len & 0xC0) == 0xC0) // Pointer
+            std::string label = "";
+            if ((len & 0xC0) == 0xC0) // Check if it is a pointer
             {
                 uint16_t offset = ((len & 0x3F) << 8) | read_8bits();
-                offset &= 0x3FFF;
 
-                // Push the current position before jumping to the offset
-                pointers.push(position_);
-
+                if (current_pos == 0)
+                {
+                    current_pos = position_;
+                }
+                
                 position_ = offset;
             }
             else
             {
-                read_buffer(name_buffer_ + i, len);
-                i += len;
-                name_buffer_[i] = '.';
-                i++;
+                position_ -= 1;
+                label = read_text();
+                if (label == "" || label.length() > dns::max_label_size)
+                {
+                    throw std::system_error(
+                        dns::errc::make_error_code(dns::errc::error_code::buffer_format_error));
+                }
+
+                if (result != "")
+                {
+                    result += ".";
+                }
+
+                result += label;
             }
+
+            len = read_8bits();
         }
 
-        if (data_[position_] == 0)
-            position_++;
-
-        while (!pointers.empty())
+        if (current_pos > 0)
         {
-            position_ = pointers.top();
-            pointers.pop();
+            position_ = current_pos;
         }
 
-        name_buffer_[i - 1] = 0;
-        std::string domain(name_buffer_);
-        return domain;
+        return result;
     }
 
     std::string dns_buffer::read_text()
     {
         uint8_t length = read_8bits();
         char *buffer = new char[length + 1];
-        if (read_buffer(buffer, length))
-        {
-            buffer[length] = '\0';
-            std::string str(buffer);
-            delete[] buffer;
-            return str;
-        }
-        else
-        {
-            delete[] buffer;
-            return "";
-        }
-    }
+        read_buffer(buffer, length);
 
-    uint8_t *dns_buffer::data() const
-    {
-        return data_;
+        buffer[length] = '\0';
+        std::string str(buffer);
+        delete[] buffer;
+        return str;
     }
 }

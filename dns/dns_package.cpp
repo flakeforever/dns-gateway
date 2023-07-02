@@ -72,7 +72,6 @@ namespace dns
     }
 
     dns_package::dns_package()
-        : buffer_(dns::buffer_size)
     {
         id_ = 0;
         flags_ = 0;
@@ -84,7 +83,7 @@ namespace dns
 
     void dns_package::add_question(std::string domain, dns::anwser_type question_type)
     {
-        id_ = generate_id(1000, 50000);
+        id_ = generate_id(1000, 5000);
         que_count_++;
 
         flag_qr(static_cast<uint8_t>(dns::qr_type::request));
@@ -156,78 +155,105 @@ namespace dns
 
     bool dns_package::parse(const char *data, uint16_t data_length)
     {
-        buffer_.resize(0);
-        buffer_.position(0);
-        buffer_.write_buffer(data, data_length);
+        dns_buffer buffer((uint8_t*)data, data_length);
 
-        buffer_.position(0);
-        id_ = buffer_.read_16bits();
-        flags_ = buffer_.read_16bits();
-        que_count_ = buffer_.read_16bits();
-        ans_count_ = buffer_.read_16bits();
-        aut_count_ = buffer_.read_16bits();
-        add_count_ = buffer_.read_16bits();
+        id_ = buffer.read_16bits();
+        flags_ = buffer.read_16bits();
+        que_count_ = buffer.read_16bits();
+        ans_count_ = buffer.read_16bits();
+        aut_count_ = buffer.read_16bits();
+        add_count_ = buffer.read_16bits();
 
         for (int i = 0; i < que_count_; ++i)
         {
-            std::string q_domain = buffer_.read_domain();
-            uint16_t q_type = buffer_.read_16bits();
-            uint16_t q_class = buffer_.read_16bits();
+            std::string q_domain = buffer.read_domain();
+            if (q_domain == "")
+            {
+                return false;
+            }
+
+            uint16_t q_type = buffer.read_16bits();
+            uint16_t q_class = buffer.read_16bits();
 
             std::shared_ptr<dns_question> question = std::make_shared<dns_question>(q_domain, q_type, q_class);
             questions_.push_back(question);
-        }
+        }    
 
         for (int i = 0; i < ans_count_; ++i)
         {
-            std::string a_domain = buffer_.read_domain();
-            uint16_t a_type = buffer_.read_16bits();
-            uint16_t a_class = buffer_.read_16bits();
-            uint32_t a_ttl = buffer_.read_32bits();
-            uint16_t a_length = buffer_.read_16bits();
+            std::string a_domain = buffer.read_domain();
+            if (a_domain == "")
+            {
+                return false;
+            }
+
+            uint16_t a_type = buffer.read_16bits();
+            uint16_t a_class = buffer.read_16bits();
+            uint32_t a_ttl = buffer.read_32bits();
+            uint16_t a_length = buffer.read_16bits();
 
             switch (static_cast<anwser_type>(a_type))
             {
             case anwser_type::a:
             {
                 std::shared_ptr<dns_a_answer> answer = std::make_shared<dns_a_answer>(a_domain, a_class, a_ttl);
-                buffer_.read_buffer((char *)&answer->addr[0], a_length);
+                buffer.read_buffer((char *)&answer->addr[0], a_length);
                 answers_.push_back(answer);
                 break;
             }
             case anwser_type::aaaa:
             {
                 std::shared_ptr<dns_aaaa_answer> answer = std::make_shared<dns_aaaa_answer>(a_domain, a_class, a_ttl);
-                buffer_.read_buffer((char *)&answer->addr[0], a_length);
+                buffer.read_buffer((char *)&answer->addr[0], a_length);
                 answers_.push_back(answer);
                 break;
             }
             case anwser_type::cname:
             {
                 std::shared_ptr<dns_cname_answer> answer = std::make_shared<dns_cname_answer>(a_domain, a_class, a_ttl);
-                answer->domain = buffer_.read_domain();
+                answer->domain = buffer.read_domain();
+                if (answer->domain == "")
+                {
+                    return false;
+                }
+
                 answers_.push_back(answer);
                 break;
             }
             case anwser_type::ns:
             {
                 std::shared_ptr<dns_ns_answer> answer = std::make_shared<dns_ns_answer>(a_domain, a_class, a_ttl);
-                answer->domain = buffer_.read_domain();
+                answer->domain = buffer.read_domain();
+                if (answer->domain == "")
+                {
+                    return false;
+                }
+
                 answers_.push_back(answer);
                 break;
             }
             case anwser_type::mx:
             {
                 std::shared_ptr<dns_mx_answer> answer = std::make_shared<dns_mx_answer>(a_domain, a_class, a_ttl);
-                answer->priority = buffer_.read_16bits();
-                answer->domain = buffer_.read_domain();
+                answer->priority = buffer.read_16bits();
+                answer->domain = buffer.read_domain();
+                if (answer->domain == "")
+                {
+                    return false;
+                }
+
                 answers_.push_back(answer);
                 break;
             }
             case anwser_type::txt:
             {
                 std::shared_ptr<dns_txt_answer> answer = std::make_shared<dns_txt_answer>(a_domain, a_class, a_ttl);
-                answer->text = buffer_.read_text();
+                answer->text = buffer.read_text();
+                if (answer->text == "")
+                {
+                    return false;
+                }
+
                 answers_.push_back(answer);
                 break;
             }
@@ -313,86 +339,85 @@ namespace dns
 
     int dns_package::dump(char *data, uint16_t data_length)
     {
-        buffer_.clear();
-        buffer_.write_16bits(id_);
-        buffer_.write_16bits(flags_);
-        buffer_.write_16bits(que_count_);
-        buffer_.write_16bits(ans_count_);
-        buffer_.write_16bits(0);
-        buffer_.write_16bits(0);
+        dns::dns_buffer buffer((uint8_t*)data, data_length);
+
+        buffer.write_16bits(id_);
+        buffer.write_16bits(flags_);
+        buffer.write_16bits(que_count_);
+        buffer.write_16bits(ans_count_);
+        buffer.write_16bits(0);
+        buffer.write_16bits(0);
 
         for (std::shared_ptr<dns_question> q : questions_)
         {
-            buffer_.write_domain(q->q_name());
-            buffer_.write_16bits(q->q_type());
-            buffer_.write_16bits(q->q_class());
+            buffer.write_domain(q->q_name());
+            buffer.write_16bits(q->q_type());
+            buffer.write_16bits(q->q_class());
         }
 
         for (std::shared_ptr<dns_answer> a : answers_)
         {
-            buffer_.write_domain(a->a_name());
-            buffer_.write_16bits(a->a_type());
-            buffer_.write_16bits(a->a_class());
-            buffer_.write_32bits(a->a_ttl());
+            buffer.write_domain(a->a_name());
+            buffer.write_16bits(a->a_type());
+            buffer.write_16bits(a->a_class());
+            buffer.write_32bits(a->a_ttl());
 
-            size_t length_pos = buffer_.position();
-            buffer_.write_16bits(0);
+            size_t length_pos = buffer.position();
+            buffer.write_16bits(0);
 
-            size_t start_pos = buffer_.position();
+            size_t start_pos = buffer.position();
             switch (static_cast<anwser_type>(a->a_type()))
             {
             case anwser_type::a:
             {
                 std::shared_ptr<dns_a_answer> answer = std::dynamic_pointer_cast<dns_a_answer>(a);
-                buffer_.write_buffer((const char *)&answer->addr[0], sizeof(answer->addr));
+                buffer.write_buffer((const char *)&answer->addr[0], sizeof(answer->addr));
                 break;
             }
             case anwser_type::aaaa:
             {
                 std::shared_ptr<dns_aaaa_answer> answer = std::dynamic_pointer_cast<dns_aaaa_answer>(a);
-                buffer_.write_buffer((const char *)&answer->addr[0], sizeof(answer->addr));
+                buffer.write_buffer((const char *)&answer->addr[0], sizeof(answer->addr));
                 break;
             }
             case anwser_type::cname:
             {
                 std::shared_ptr<dns_cname_answer> answer = std::dynamic_pointer_cast<dns_cname_answer>(a);
-                buffer_.write_domain(answer->domain);
+                buffer.write_domain(answer->domain);
                 break;
             }
             case anwser_type::ns:
             {
                 std::shared_ptr<dns_ns_answer> answer = std::dynamic_pointer_cast<dns_ns_answer>(a);
-                buffer_.write_domain(answer->domain);
+                buffer.write_domain(answer->domain);
                 break;
             }
             case anwser_type::mx:
             {
                 std::shared_ptr<dns_mx_answer> answer = std::dynamic_pointer_cast<dns_mx_answer>(a);
-                buffer_.write_16bits(answer->priority);
-                buffer_.write_domain(answer->domain);
+                buffer.write_16bits(answer->priority);
+                buffer.write_domain(answer->domain);
                 break;
             }
             case anwser_type::txt:
             {
                 std::shared_ptr<dns_txt_answer> answer = std::dynamic_pointer_cast<dns_txt_answer>(a);
-                buffer_.write_text(answer->text);
+                buffer.write_text(answer->text);
                 break;
             }
             default:
                 return 0;
             }
 
-            size_t current_pos = buffer_.position();
+            size_t current_pos = buffer.position();
             uint16_t length = current_pos - start_pos;
 
-            buffer_.position(length_pos);
-            buffer_.write_16bits(length);
-            buffer_.position(current_pos);
+            buffer.position(length_pos);
+            buffer.write_16bits(length);
+            buffer.position(current_pos);
         }
 
-        buffer_.position(0);
-        buffer_.read_buffer(data, buffer_.size());
-        return buffer_.size();
+        return buffer.size();
     }
 
     uint32_t dns_package::get_ttl()
@@ -403,7 +428,7 @@ namespace dns
             if (result == 0 || result < a->a_ttl())
             {
                 result = a->a_ttl();
-            }           
+            }
         }
 
         return result;
@@ -428,7 +453,6 @@ namespace dns
 
         questions_.clear();
         answers_.clear();
-        buffer_.clear();
     }
 
     uint8_t dns_package::flag_qr()

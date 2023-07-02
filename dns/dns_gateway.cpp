@@ -16,16 +16,48 @@
 #include "dns_buffer.hpp"
 #include "dns_cache.hpp"
 #include "dns_package.hpp"
+// #include <message.h>
 
 namespace dns
 {
-    dns_gateway::dns_gateway(asio::any_io_executor executor, std::string address, uint16_t port, int max_works)
-        : executor_(std::move(executor)),
-          port_(port),
-          udp_socket_(executor_, asio::ip::udp::endpoint(asio::ip::make_address(address), port)),
-          semaphore_()
+    dns_object::dns_object()
     {
-        init_semaphore(max_works);
+    }
+
+    dns_object::~dns_object()
+    {
+    }
+
+    dns_gateway::dns_gateway(asio::any_io_executor executor,
+                             asio::ip::udp::resolver::protocol_type protocol, uint16_t port,
+                             int min_pools, int max_pools)
+        : executor_(executor),
+          port_(port),
+          udp_socket_(executor, asio::ip::udp::endpoint(protocol, port)),
+          object_pool_(executor, min_pools, max_pools),
+          router_(executor),
+          cache_(executor)
+    {
+    }
+
+    dns_gateway::dns_gateway(asio::any_io_executor executor,
+                             std::string address, uint16_t port,
+                             int min_pools, int max_pools)
+        : executor_(executor),
+          port_(port),
+          udp_socket_(executor, asio::ip::udp::endpoint(asio::ip::make_address(address), port)),
+          object_pool_(executor, min_pools, max_pools),
+          router_(executor),
+          cache_(executor)
+    {
+    }
+
+    std::string endpoint_to_string(const asio::ip::udp::endpoint &endpoint)
+    {
+        std::string address = endpoint.address().to_string();
+        unsigned short port = endpoint.port();
+
+        return address + ":" + std::to_string(port);
     }
 
     asio::awaitable<void> dns_gateway::run_process()
@@ -38,55 +70,100 @@ namespace dns
                 // receive data from udp listening
                 int length = co_await do_receive();
 
+                if (length <= 0)
+                {
+                    logger.error("length error");
+                    continue;
+                }
+
+                dns::dns_package package;
+                try
+                {
+                    package.parse(buffer_, length);
+                }
+                catch (const std::exception &e)
+                {
+                    logger.error("DNS exception occured when parsing incoming data");
+                    continue;
+                }
+
+                if (package.flag_qr() != 0 || package.que_count() == 0 || package.ans_count() > 0)
+                {
+                    continue;
+                }
+
                 // get a dns object from queue
-                std::shared_ptr<semaphore_object> object = semaphore_.get_object();
-                std::shared_ptr<dns::dns_object> dns_object = std::static_pointer_cast<dns::dns_object>(object);
+                dns::dns_object *dns_object = co_await object_pool_.get_object();
+                if (dns_object == nullptr)
+                {
+                    logger.error("dns_object is null");
+                    continue;
+                }
 
                 // init dns object
+                memset(dns_object->buffer_, 0, sizeof(dns_object->buffer_));
                 memcpy(dns_object->buffer_, buffer_, length);
                 dns_object->buffer_length_ = length;
+
+                dns_object->question_id_ = package.id();
+                dns_object->question_domain_ = package.questions_[0]->q_name();
+                dns_object->question_type_ = package.questions_[0]->q_type();
                 dns_object->remote_endpoint_ = remote_endpoint_;
+                dns_object->status_ = 1;
+
+                logger.debug("request %d %s type %d from %s",
+                             dns_object->question_id_, dns_object->question_domain_.c_str(), dns_object->question_type_,
+                             endpoint_to_string(dns_object->remote_endpoint_).c_str());
 
                 // define a coroutine for request
-                auto request_coroutine = [&](std::shared_ptr<dns::dns_object> new_object) -> asio::awaitable<void>
+                auto request_coroutine = [&](dns::dns_object *new_object) -> asio::awaitable<void>
                 {
-                    // parse request data
-                    new_object->dns_package_.reset();
-                    new_object->dns_package_.parse(new_object->buffer_, new_object->buffer_length_);
-                    // new_object->dns_package_.output();
+                    await_timeout_execute timeout_execute(executor_);
+                    co_await timeout_execute.execute_until(
+                        std::chrono::milliseconds(dns::coroutine_timeout),
+                        [&](asio::steady_timer &timer) -> asio::awaitable<void>
+                        {
+                            try
+                            {
+                                // parse request data
+                                new_object->status_ = 2;
 
-                    if (!new_object->dns_package_.questions_.size())
-                    {
-                        // push back a dns object to queue
-                        semaphore_.notify(dns_object);
-                        co_return;
-                    }
+                                // // handle dns static
+                                // bool status = co_await handle_dns_static(new_object, request_domain, request_type);
+                                // if (status)
+                                // {
+                                //     co_await object_pool_.release_object(new_object);
+                                //     timer.cancel();
+                                //     co_return;
+                                // }
 
-                    // get request domain and type
-                    std::string request_domain = new_object->dns_package_.questions_[0]->q_name();
-                    dns::anwser_type request_type =
-                        static_cast<dns::anwser_type>(new_object->dns_package_.questions_[0]->q_type());
+                                // handle dns cache
+                                bool status = co_await handle_query_cache(new_object);
+                                if (!status)
+                                {
+                                    // handle dns request
+                                    co_await handle_dns_request(new_object);
+                                }
+                            }
+                            catch (const std::exception &e)
+                            {
+                                if (!timeout_execute.timeout())
+                                {
+                                    logger.error("request error : %s %s", new_object->question_domain_.c_str(), e.what());
+                                }
+                                else
+                                {
+                                    logger.error("timeout error : %s", new_object->question_domain_.c_str());
+                                }
+                            }
 
-                    // handle dns static
-                    bool status = co_await handle_dns_static(new_object, request_domain, request_type);
-                    if (status)
-                    {
-                        semaphore_.notify(new_object);
-                        co_return;
-                    }
+                            if (!timeout_execute.timeout())
+                            {
+                                timer.cancel();
+                            }
+                        });
 
-                    // handle dns cache
-                    status = co_await handle_query_cache(new_object, request_domain, request_type);
-                    if (status)
-                    {
-                        semaphore_.notify(new_object);
-                        co_return;
-                    }
-
-                    // handle dns request
-                    co_await handle_dns_request(new_object, request_domain, request_type);
-
-                    semaphore_.notify(new_object);
+                    co_await object_pool_.release_object(new_object);
                     co_return;
                 };
 
@@ -95,7 +172,7 @@ namespace dns
             }
             catch (const std::exception &e)
             {
-                logger.error("error: %s", e.what());
+                logger.error("process error: %s", e.what());
                 break;
             }
         }
@@ -139,124 +216,150 @@ namespace dns
     asio::awaitable<bool> dns_gateway::handle_dns_static(
         std::shared_ptr<dns::dns_object> dns_object, std::string request_domain, dns::anwser_type request_type)
     {
-        if (dns_object->dns_package_.questions_.size() == 1)
-        {
-            // check domain static
-            std::vector<std::string> static_values = router_.get_statics().get_static_values(request_domain, request_type);
+        // if (dns_object->dns_package_.questions_.size() == 1)
+        // {
+        //     // check domain static
+        //     std::vector<std::string> static_values = router_.get_statics().get_static_values(request_domain, request_type);
 
-            if (static_values.size() > 0)
-            {
-                for (auto value : static_values)
-                {
-                    dns_object->dns_package_.add_anwser(request_domain, request_type, value);
-                }
+        //     if (static_values.size() > 0)
+        //     {
+        //         for (auto value : static_values)
+        //         {
+        //             dns_object->dns_package_.add_anwser(request_domain, request_type, value);
+        //         }
 
-                //  Forward the response to the client
-                dns_object->buffer_length_ =
-                    dns_object->dns_package_.dump(dns_object->buffer_, sizeof(dns_object->buffer_));
+        //         //  Forward the response to the client
+        //         dns_object->buffer_length_ =
+        //             dns_object->dns_package_.dump(dns_object->buffer_, sizeof(dns_object->buffer_));
 
-                co_await udp_socket_.async_send_to(
-                    asio::buffer(dns_object->buffer_, dns_object->buffer_length_),
-                    dns_object->remote_endpoint_,
-                    asio::use_awaitable);
+        //         co_await udp_socket_.async_send_to(
+        //             asio::buffer(dns_object->buffer_, dns_object->buffer_length_),
+        //             dns_object->remote_endpoint_,
+        //             asio::use_awaitable);
 
-                co_return true;
-            }
-        }
+        //         co_return true;
+        //     }
+        // }
 
         co_return false;
     }
 
-    bool dns_gateway::handle_create_cache(
-        std::shared_ptr<dns::dns_object> dns_object, std::string request_domain, dns::anwser_type request_type)
+    asio::awaitable<bool> dns_gateway::handle_create_cache(dns::dns_object *dns_object)
     {
-        std::shared_ptr<dns_cache_entry> cache_entry = cache_.pop_free_cache();
-        if (cache_entry == nullptr)
-        {
-            cache_.update();
-        }
-
-        cache_entry = cache_.pop_free_cache();
+        dns_cache_entry *cache_entry = co_await cache_.pop_free_cache();
         if (cache_entry != nullptr)
         {
-            cache_entry->domain = request_domain;
-            cache_entry->dns_package_.reset();
-            cache_entry->dns_package_.parse(dns_object->buffer_, dns_object->buffer_length_);
-            cache_entry->create_time_ = get_current_time();
-            cache_entry->ttl_ = cache_entry->dns_package_.get_ttl();
-            // cache_entry->cache_ttl_ = cache_entry->ttl_;
+            cache_entry->domain_ = dns_object->question_domain_;
+            cache_entry->create_time_ = dns::get_current_time();
+            cache_entry->ttl_ = 600;
 
-            // if (cache_entry->cache_ttl_ > 60)
-            // {
-            //     cache_entry->cache_ttl_ = 60;
-            // }
+            memcpy(cache_entry->buffer_, dns_object->buffer_, dns_object->buffer_length_);
+            cache_entry->buffer_size_ = dns_object->buffer_length_;
 
-            cache_.add_cache(request_domain, request_type, cache_entry);
-            return true;
-        }
-
-        return false;
-    }
-
-    asio::awaitable<bool> dns_gateway::handle_query_cache(
-        std::shared_ptr<dns::dns_object> dns_object, std::string request_domain, dns::anwser_type request_type)
-    {
-        std::shared_ptr<dns_cache_entry> cache_entry = cache_.query_cache(request_domain, request_type);
-        if (cache_entry != nullptr)
-        {
-            cache_entry->lock();
-            cache_entry->dns_package_.id(dns_object->dns_package_.id());
-
-            int elapsed_time = get_current_time() - cache_entry->create_time_;
-            int remaining_ttl = cache_entry->ttl_ - elapsed_time;
-
-            // Ensure remaining TTL is at least 1
-            if (remaining_ttl <= 0)
-            {
-                remaining_ttl = 1;
-            }
-
-            cache_entry->dns_package_.set_ttl(remaining_ttl);
-
-            //  Forward the response to the client
-            dns_object->buffer_length_ =
-                cache_entry->dns_package_.dump(dns_object->buffer_, sizeof(dns_object->buffer_));
-
-            cache_entry->unlock();
-
-            co_await udp_socket_.async_send_to(
-                asio::buffer(dns_object->buffer_, dns_object->buffer_length_),
-                dns_object->remote_endpoint_,
-                asio::use_awaitable);
-
+            co_await cache_.add_cache(dns_object->question_domain_, dns_object->question_type_, cache_entry);
             co_return true;
         }
 
         co_return false;
     }
 
-    asio::awaitable<bool> dns_gateway::handle_dns_request(
-        std::shared_ptr<dns::dns_object> dns_object, std::string request_domain, dns::anwser_type request_type)
+    asio::awaitable<bool> dns_gateway::handle_query_cache(dns::dns_object *dns_object)
+    {
+        dns_cache_entry *cache_entry =
+            co_await cache_.query_cache(dns_object->question_domain_, dns_object->question_type_);
+        if (cache_entry != nullptr)
+        {
+            {
+                await_lock lock(executor_, cache_entry->mutex_);
+                co_await lock.check_lock();
+
+                dns::dns_package package;
+                bool status = false;
+                try
+                {
+                    status = package.parse(cache_entry->buffer_, cache_entry->buffer_size_);
+                }
+                catch (const std::exception &e)
+                {
+                }
+
+                if (!status)
+                {
+                    co_return false;
+                }
+
+                package.id(dns_object->question_id_);
+
+                int elapsed_time = (dns::get_current_time() - cache_entry->create_time_) / 1000;
+                int remaining_ttl = cache_entry->ttl_ - elapsed_time;
+
+                // Ensure remaining TTL is at least 1
+                if (remaining_ttl <= 0)
+                {
+                    remaining_ttl = 1;
+                }
+
+                package.set_ttl(remaining_ttl);
+
+                try
+                {
+                    dns_object->buffer_length_ = package.dump(dns_object->buffer_, sizeof(dns_object->buffer_));
+                    package.output();
+                }
+                catch (const std::exception &e)
+                {
+                    logger.error("package dump error: %s", e.what());
+                    co_return false;
+                }
+
+                if (dns_object->buffer_length_ == 0)
+                {
+                    logger.error("package dump: buffer_length_ == 0");
+                    co_return false;
+                }
+            }
+
+            co_await udp_socket_.async_send_to(
+                asio::buffer(dns_object->buffer_, dns_object->buffer_length_),
+                dns_object->remote_endpoint_,
+                asio::use_awaitable);
+
+            logger.info("response remote by cache");
+            co_return true;
+        }
+
+        co_return false;
+    }
+
+    asio::awaitable<bool> dns_gateway::handle_dns_request(dns::dns_object *dns_object)
     {
         bool result = false;
+
+        dns_object->status_ = 3;
         // get an upstream group by domain
         std::shared_ptr<dns_upstream_group> current_group = router_.default_group;
-        uint8_t group_id = router_.get_route(request_domain);
+        uint8_t group_id = co_await router_.get_route(dns_object->question_domain_);
         std::shared_ptr<dns::dns_upstream_group> upstream_group = router_.get_group(group_id);
 
         if (upstream_group)
         {
             current_group = upstream_group;
-            dns::logger.debug("route : %s -> %s", request_domain.c_str(), upstream_group->name().c_str());
+            dns::logger.debug("route : %s -> %s", dns_object->question_domain_.c_str(), upstream_group->name().c_str());
         }
         else
         {
             dns::logger.debug("default route : %s -> %s",
-                              request_domain.c_str(), router_.default_group->name().c_str());
+                              dns_object->question_domain_.c_str(), router_.default_group->name().c_str());
         }
 
         // get an upstream
-        std::shared_ptr<dns_upstream> dns_upstream = current_group->get_next_upstream();
+        std::shared_ptr<dns_upstream> dns_upstream = co_await current_group->get_next_upstream();
+
+        if (dns_upstream == nullptr)
+        {
+            dns::logger.error("dns_upstream is null");
+            co_return false;
+        }
 
         // define a handle for response
         auto handle_response = [&](std::error_code ec, const char *data, uint16_t data_length) -> asio::awaitable<void>
@@ -264,26 +367,56 @@ namespace dns
             if (!ec)
             {
                 // Note that using shared_ptr in a new coroutine requires re-referencing
-                std::shared_ptr<dns::dns_object> current_object = dns_object;
+                dns::dns_object *current_object = dns_object;
+                dns_object->status_ = 4;
 
-                // parse dns data from response
-                current_object->dns_package_.reset();
-                current_object->dns_package_.parse(data, data_length);
-                // current_object->dns_package_.output();
+                if (data_length > dns::buffer_size)
+                {
+                    co_return;
+                }
 
-                //  Forward the response to the client
-                current_object->buffer_length_ =
-                    current_object->dns_package_.dump(current_object->buffer_, sizeof(current_object->buffer_));
+                if (data_length <= sizeof(current_object->buffer_))
+                {
+                    dns::dns_package package;
+                    bool status = false;
+                    try
+                    {
+                        status = package.parse(data, data_length);
+                    }
+                    catch (const std::exception &e)
+                    {
+                    }
 
-                // update dns cache
-                handle_create_cache(current_object, request_domain, request_type);
+                    if (status)
+                    {
+                        // update dns cache
+                        memcpy(current_object->buffer_, data, data_length);
+                        current_object->buffer_length_ = data_length;
 
-                co_await udp_socket_.async_send_to(
-                    asio::buffer(current_object->buffer_, current_object->buffer_length_),
-                    current_object->remote_endpoint_,
-                    asio::use_awaitable);
+                        co_await handle_create_cache(current_object);
 
-                result = true;
+                        logger.debug("response %d %s type %d to %s",
+                                     current_object->question_id_, current_object->question_domain_.c_str(),
+                                     current_object->question_type_,
+                                     endpoint_to_string(current_object->remote_endpoint_).c_str());
+
+                        memset(current_object->buffer_, 0, sizeof(current_object->buffer_));
+                        current_object->buffer_length_ =
+                            package.dump(current_object->buffer_, sizeof(current_object->buffer_));
+
+                        co_await udp_socket_.async_send_to(
+                            asio::buffer(current_object->buffer_, current_object->buffer_length_),
+                            current_object->remote_endpoint_, asio::use_awaitable);
+                    }
+                    else
+                    {
+                        co_await udp_socket_.async_send_to(
+                            asio::buffer(data, data_length),
+                            current_object->remote_endpoint_, asio::use_awaitable);
+                    }
+
+                    result = true;
+                }
             }
             else
             {
@@ -298,8 +431,8 @@ namespace dns
 
     asio::awaitable<void> dns_gateway::wait_terminated()
     {
-        async_wait async_wait(executor_);
-        co_await async_wait.wait_until(
+        await_wait wait(executor_);
+        co_await wait.wait_until(
             std::chrono::milliseconds(10),
             [&](bool &finished)
             {
@@ -310,17 +443,9 @@ namespace dns
             });
     }
 
-    void dns_gateway::init_semaphore(int max_works)
-    {
-        for (int i = 0; i < max_works; i++)
-        {
-            std::shared_ptr<dns::dns_object> dns_object = std::make_shared<dns::dns_object>();
-            semaphore_.add_object(dns_object);
-        }
-    }
-
     asio::awaitable<int> dns_gateway::do_receive()
     {
+        memset(buffer_, 0, sizeof(buffer_));
         co_return co_await udp_socket_.async_receive_from(asio::buffer(buffer_), remote_endpoint_, asio::use_awaitable);
     }
 
@@ -336,7 +461,6 @@ namespace dns
         {
             int domain_index = 0;
             char buffer[dns::buffer_size];
-            dns_package request_package;
 
             checker_started_ = true;
             while (active_)
@@ -356,22 +480,47 @@ namespace dns
 
                             if (time_diff >= std::chrono::seconds(upstream->check_interval()))
                             {
-                                request_package.reset();
-                                request_package.add_question(domain, dns::anwser_type::a);
-                                int length = request_package.dump(buffer, dns::buffer_size);
+                                dns_package package;
+                                package.add_question(domain, dns::anwser_type::a);
+                                int length = package.dump(buffer, sizeof(buffer));
 
-                                // define a handle for response
-                                auto handle_response = [&](std::error_code ec, const char *data, uint16_t data_length) -> asio::awaitable<void>
-                                {
-                                    if (ec)
+                                await_timeout_execute timeout_execute(executor_);
+                                co_await timeout_execute.execute_until(
+                                    std::chrono::milliseconds(dns::coroutine_timeout),
+                                    [&](asio::steady_timer &timer) -> asio::awaitable<void>
                                     {
-                                        logger.error("error: %d message: %s", ec.value(), ec.message().c_str());
-                                    }
+                                        try
+                                        {
+                                            // define a handle for response
+                                            auto handle_response = [&](std::error_code ec, const char *data, uint16_t data_length) -> asio::awaitable<void>
+                                            {
+                                                if (ec)
+                                                {
+                                                    logger.error("check error: %d message: %s", ec.value(), ec.message().c_str());
+                                                }
 
-                                    co_return;
-                                };
+                                                co_return;
+                                            };
 
-                                co_await upstream->send_request(buffer, length, handle_response);
+                                            co_await upstream->send_request(buffer, length, handle_response);
+                                        }
+                                        catch (const std::exception &e)
+                                        {
+                                            if (!timeout_execute.timeout())
+                                            {
+                                                logger.error("request error : check upstream");
+                                            }
+                                            else
+                                            {
+                                                logger.error("timeout error : check upstream");
+                                            }
+                                        }
+
+                                        if (!timeout_execute.timeout())
+                                        {
+                                            timer.cancel();
+                                        }
+                                    });
                             }
                         }
                     }

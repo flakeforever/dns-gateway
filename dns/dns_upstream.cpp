@@ -13,7 +13,6 @@
 
 #include "dns_upstream.hpp"
 #include "dns_log.hpp"
-#include "base64.hpp"
 #include "./../lib/CxxUrl/url.hpp"
 
 using asio::awaitable;
@@ -79,24 +78,6 @@ namespace dns
     {
     }
 
-    asio::awaitable<void> dns_upstream::wait_until_lock(std::unique_lock<std::mutex> &lock, std::chrono::milliseconds duration)
-    {
-        if (!lock.owns_lock())
-        {
-            async_wait async_wait(executor_);
-            co_await async_wait.wait_until(
-                duration,
-                [&](bool &finished)
-                {
-                    lock.try_lock();
-                    if (lock.owns_lock())
-                    {
-                        finished = true;
-                    }
-                });
-        }
-    }
-
     dns_udp_upstream::dns_udp_upstream(asio::any_io_executor executor, std::string host, uint16_t port)
         : dns_upstream(executor),
           client_(executor)
@@ -118,82 +99,30 @@ namespace dns
 
     asio::awaitable<void> dns_udp_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
     {
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        co_await wait_until_lock(lock, std::chrono::milliseconds(10));
+        await_lock lock(executor_, mutex_);
+        co_await lock.check_lock();
 
         // check associate status
         if (!client_.is_associated())
         {
-            async_execute execute(executor_);
-            co_await execute.execute_until(
-                std::chrono::milliseconds(connect_timeout),
-                [&](asio::steady_timer &timer) -> asio::awaitable<void>
-                {
-                    try
-                    {
-                        co_await associate();
-                    }
-                    catch (const std::system_error &e)
-                    {
-                        if (execute.timeout())
-                        {
-                            co_await execute_handler(handler, errc::error_code::request_timeout);
-                        }
-                        else
-                        {
-                            co_await execute_handler(handler, e);
-                        }
-                    }
-                    catch (const std::exception &e)
-                    {
-                        co_await execute_handler(handler, errc::error_code::unknown_error);
-                    }
-
-                    timer.cancel();
-                });
+            co_await associate();
         }
 
         // send dns request
         last_request_time_ = asio::steady_timer::clock_type::now();
-        async_execute execute(executor_);
-        co_await execute.execute_until(
-            std::chrono::milliseconds(request_timeout),
-            [&](asio::steady_timer &timer) -> asio::awaitable<void>
-            {
-                try
-                {
-                    int length = co_await client_.send(data, data_length);
+        int length = co_await client_.send(data, data_length);
 
-                    if (length != data_length)
-                    {
-                        co_await execute_handler(handler, errc::error_code::request_failed);
-                    }
+        if (length != data_length)
+        {
+            co_await execute_handler(handler, errc::error_code::request_failed);
+        }
 
-                    length = co_await client_.recv(buffer_, sizeof(buffer_));
+        length = co_await client_.recv(buffer_, sizeof(buffer_));
 
-                    if (length > 0)
-                    {
-                        co_await execute_handler(handler, errc::error_code::no_error, buffer_, length);
-                    }
-                }
-                catch (const std::system_error &e)
-                {
-                    if (execute.timeout())
-                    {
-                        co_await execute_handler(handler, errc::error_code::request_timeout);
-                    }
-                    else
-                    {
-                        co_await execute_handler(handler, e);
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    co_await execute_handler(handler, errc::error_code::unknown_error);
-                }
-
-                timer.cancel();
-            });
+        if (length > 0)
+        {
+            co_await execute_handler(handler, errc::error_code::no_error, buffer_, length);
+        }
     }
 
     dns_https_upstream::dns_https_upstream(asio::any_io_executor executor, std::string url)
@@ -238,142 +167,83 @@ namespace dns
 
     asio::awaitable<void> dns_https_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
     {
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
-        co_await wait_until_lock(lock, std::chrono::milliseconds(10));
+        await_lock lock(executor_, mutex_);
+        co_await lock.check_lock();
 
         // check connection status
         if (!client_->is_connected())
         {
-            async_execute execute(executor_);
-            co_await execute.execute_until(
-                std::chrono::milliseconds(connect_timeout),
-                [&](asio::steady_timer &timer) -> asio::awaitable<void>
-                {
-                    try
-                    {
-                        co_await connect();
-                    }
-                    catch (const std::system_error &e)
-                    {
-                        if (execute.timeout())
-                        {
-                            co_await execute_handler(handler, errc::error_code::request_timeout);
-                        }
-                        else
-                        {
-                            co_await execute_handler(handler, e);
-                        }
-                    }
-                    catch (const std::exception &e)
-                    {
-                        co_await execute_handler(handler, errc::error_code::unknown_error);
-                    }
-
-                    timer.cancel();
-                });
+            co_await connect();
         }
 
         // send dns request
         last_request_time_ = asio::steady_timer::clock_type::now();
-        async_execute execute(executor_);
-        co_await execute.execute_until(
-            std::chrono::milliseconds(request_timeout),
-            [&](asio::steady_timer &timer) -> asio::awaitable<void>
+        std::string request = "POST " + path_ + " HTTP/1.1\r\n"
+                              "Host: " + host_ + "\r\n"
+                              "Content-Type: application/dns-message\r\n"
+                              "Connection: keep-alive\r\n"
+                              "Content-Length: " + std::to_string(data_length) + "\r\n"
+                              "\r\n";
+
+        request.append(data, data_length);
+        co_await client_->write(request.c_str(), request.length());
+
+        std::string response;
+        int header_length = co_await asio::async_read_until(
+            client_->get_socket(), asio::dynamic_buffer(response, 1024), "\r\n\r\n", asio::use_awaitable);
+
+        // char header_str[1024];
+        // memset(header_str, 0, sizeof(header_str));
+        // response.copy(header_str, header_length, 0);
+        // std::cerr << "header: " << header_str << std::endl;
+
+        http_header header = parse_http_header(response);
+        if (check_http_header(header))
+        {
+            if (logger.level() == dns::log_level::debug)
             {
-                try
+                logger.debug("response: %s", header.http_version.c_str());
+                logger.debug("HTTP status:  %d", header.status_code);
+                logger.debug("Date: %s", header.date.c_str());
+            }
+
+            int remaining_length = response.size() - header_length;
+            if (header.content_length > remaining_length)
+            {
+                if (header.content_length > dns::buffer_size)
                 {
-                    // dns request
-                    if (logger.level() == dns::log_level::debug)
+                    co_await execute_handler(handler, errc::error_code::buffer_not_enough);
+                }
+                else
+                {
+                    response.copy(buffer_, remaining_length, header_length);
+
+                    int length = co_await client_->read(buffer_ + remaining_length, header.content_length - remaining_length);
+
+                    if (length == header.content_length - remaining_length)
                     {
-                        std::string base64_request = base64::encode(data, data_length);
-                        logger.debug("request: %s", base64_request.c_str());
-                    }
-
-                    std::string request = "POST " + path_ + " HTTP/1.1\r\n"
-                                          "Host: " + host_ + "\r\n"
-                                          "Content-Type: application/dns-message\r\n"
-                                          "Connection: keep-alive\r\n"
-                                          "Content-Length: " + std::to_string(data_length) + "\r\n"
-                                          "\r\n";
-
-                    co_await client_->write(request.c_str(), request.length());
-                    co_await client_->write(data, data_length);
-
-                    std::string response;
-                    int header_length = co_await asio::async_read_until(
-                        client_->get_socket(), asio::dynamic_buffer(response, 1024), "\r\n\r\n", asio::use_awaitable);
-
-                    // char header_str[1024];
-                    // memset(header_str, 0, sizeof(header_str));
-                    // response.copy(header_str, header_length, 0);
-                    // std::cerr << "header: " << header_str << std::endl;
-
-                    http_header header = parse_http_header(response);
-                    if (check_http_header(header))
-                    {
-                        if (logger.level() == dns::log_level::debug)
-                        {
-                            logger.debug("response: %s", header.http_version.c_str());
-                            logger.debug("HTTP status:  %d", header.status_code);
-                            logger.debug("Date: %s", header.date.c_str());
-                        }
-
-                        int remaining_length = response.size() - header_length;
-                        if (header.content_length > remaining_length)
-                        {
-                            if (header.content_length > dns::buffer_size)
-                            {
-                                co_await execute_handler(handler, errc::error_code::buffer_not_enough);
-                            }
-                            else
-                            {
-                                response.copy(buffer_, remaining_length, header_length);
-
-                                int length = co_await client_->read(buffer_ + remaining_length, header.content_length - remaining_length);
-
-                                if (length == header.content_length - remaining_length)
-                                {
-                                    co_await execute_handler(handler, errc::error_code::no_error, buffer_, header.content_length);
-                                }
-                                else
-                                {
-                                    co_await execute_handler(handler, errc::error_code::http_data_error);
-                                }
-                            }
-                        }
-                        else if (header.content_length == remaining_length)
-                        {
-                            response.copy(buffer_, header.content_length, header_length);
-                            co_await execute_handler(handler, errc::error_code::no_error, buffer_, header.content_length);
-                        }
-                        else
-                        {
-                            co_await execute_handler(handler, errc::error_code::http_data_error);
-                        }
+                        co_await execute_handler(handler, errc::error_code::no_error, buffer_, header.content_length);
                     }
                     else
                     {
-                        co_await execute_handler(handler, errc::error_code::http_header_invalid);
+                        co_await execute_handler(handler, errc::error_code::http_data_error);
                     }
                 }
-                catch (const std::system_error &e)
-                {
-                    if (execute.timeout())
-                    {
-                        co_await execute_handler(handler, errc::error_code::request_timeout);
-                    }
-                    else
-                    {
-                        co_await execute_handler(handler, e);
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    co_await execute_handler(handler, errc::error_code::unknown_error);
-                }
-
-                timer.cancel();
-            });
+            }
+            else if (header.content_length == remaining_length)
+            {
+                response.copy(buffer_, header.content_length, header_length);
+                co_await execute_handler(handler, errc::error_code::no_error, buffer_, header.content_length);
+            }
+            else
+            {
+                co_await execute_handler(handler, errc::error_code::http_data_error);
+            }
+        }
+        else
+        {
+            co_await execute_handler(handler, errc::error_code::http_header_invalid);
+        }
     }
 
     http_header dns_https_upstream::parse_http_header(const std::string &header_string)

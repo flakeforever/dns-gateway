@@ -51,6 +51,10 @@ namespace dns
                 return "Request timeout: DNS lookup failed";
             case error_code::buffer_not_enough:
                 return "DNS buffer is not enough";
+            case error_code::buffer_format_error:
+                return "DNS buffer format error";
+            case error_code::buffer_out_of_range:
+                return "DNS buffer out of range";
             case error_code::http_header_invalid:
                 return "HTTP header is invalid";
             case error_code::http_data_error:

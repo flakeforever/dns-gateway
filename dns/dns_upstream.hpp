@@ -15,6 +15,7 @@
 
 #include <asio.hpp>
 #include "socks/socks_client.hpp"
+#include "dns_buffer.hpp"
 #include "dns_error.hpp"
 #include "operation.hpp"
 #include "property.hpp"
@@ -22,7 +23,6 @@
 
 namespace dns
 {
-    constexpr int buffer_size = 1024;
     constexpr int connect_timeout = 15000;
     constexpr int request_timeout = 3500;
     constexpr int doh_port = 443;
@@ -58,9 +58,7 @@ namespace dns
         asio::awaitable<void> execute_handler(handle_response handler, std::system_error error, const char *data = nullptr, size_t size = 0);
         asio::awaitable<void> execute_handler(handle_response handler, dns::errc::error_code error, const char *data = nullptr, size_t size = 0);
         virtual void handle_exception(std::error_code error);
-
-        asio::awaitable<void> wait_until_lock(std::unique_lock<std::mutex> &lock, std::chrono::milliseconds duration);
-
+        
         asio::any_io_executor executor_;
         std::mutex mutex_;
         char buffer_[dns::buffer_size];

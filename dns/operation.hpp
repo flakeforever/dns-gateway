@@ -29,7 +29,11 @@ using namespace asio::experimental::awaitable_operators;
 
 class semaphore_object : public std::enable_shared_from_this<semaphore_object>
 {
-    // Define your custom object, add members and methods as per your requirements
+public:
+    semaphore_object();
+
+private:
+
 };
 
 class semaphore
@@ -47,10 +51,10 @@ private:
     std::vector<std::shared_ptr<semaphore_object>> objects_;
 };
 
-class async_wait
+class await_wait
 {
 public:
-    async_wait(asio::any_io_executor executor);
+    await_wait(asio::any_io_executor executor);
 
     asio::awaitable<void> wait_until(std::chrono::milliseconds duration,
                                      std::function<void(bool &)> callback);
@@ -64,10 +68,41 @@ private:
     asio::steady_timer timer_;
 };
 
-class async_execute
+class await_lock
 {
 public:
-    async_execute(asio::any_io_executor executor);
+    await_lock(asio::any_io_executor executor, std::mutex &mutex);
+
+    asio::awaitable<void> check_lock()
+    {
+        while (!lock_.owns_lock())
+        {
+            co_await wait(std::chrono::milliseconds(10));
+            lock_.try_lock();
+        }
+
+        co_return;
+    };
+
+    asio::awaitable<void> wait(std::chrono::milliseconds duration)
+    {
+        auto now = std::chrono::steady_clock::now();
+        auto deadline = now + duration;
+
+        timer_.expires_at(deadline);
+        co_await timer_.async_wait(asio::use_awaitable);
+    };
+
+protected:
+private:
+    asio::steady_timer timer_;
+    std::unique_lock<std::mutex> lock_;
+};
+
+class await_timeout_execute
+{
+public:
+    await_timeout_execute(asio::any_io_executor executor);
 
     asio::awaitable<void> execute_until(std::chrono::milliseconds duration,
                                         std::function<asio::awaitable<void>(asio::steady_timer &)> callback);

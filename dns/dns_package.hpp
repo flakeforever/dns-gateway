@@ -202,7 +202,5 @@ namespace dns
         bool string_to_ipv6(const std::string &address, uint8_t *buffer, std::size_t size);
 
         uint16_t generate_id(uint16_t min_id, uint16_t max_id);
-
-        dns_buffer buffer_;
     };
 }

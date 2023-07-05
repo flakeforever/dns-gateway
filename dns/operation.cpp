@@ -86,7 +86,7 @@ asio::awaitable<void> await_wait::wait(std::chrono::milliseconds duration)
 }
 
 await_lock::await_lock(asio::any_io_executor executor, std::mutex &mutex)
-    : timer_(executor), lock_(mutex, std::try_to_lock)
+    : lock_(mutex, std::try_to_lock), timer_(executor)
 {
 }
 

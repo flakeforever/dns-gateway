@@ -18,6 +18,7 @@
 #include <mutex>
 #include <algorithm>
 #include "dns_package.hpp"
+#include "operation.hpp"
 
 namespace dns
 {
@@ -58,7 +59,7 @@ namespace dns
         void init_object(int min_pools);
 
         asio::any_io_executor executor_;
-        std::mutex mutex_;
+        coroutine_mutex mutex_;
         std::vector<dns_object *> static_objects_;
         std::vector<dns_object *> active_objects_;
 

@@ -94,7 +94,7 @@ namespace dns
             {
                 dns_cache_entry *removed_entry = cache_entries_[lowest_weight_key];
 
-                logger.info("remove lowest weight entry %s", removed_entry->domain_.c_str());
+                logger.debug("remove lowest weight entry %s", removed_entry->domain_.c_str());
 
                 cache_entries_.erase(lowest_weight_key);
                 free_cache_entries_.push_back(removed_entry);
@@ -103,7 +103,7 @@ namespace dns
 
         if (free_cache_entries_.empty())
         {
-            logger.info("free cache is null");
+            // logger.info("free cache is null");
             co_return nullptr; // No free cache entry available
         }
 
@@ -124,12 +124,12 @@ namespace dns
         {
             free_cache_entries_.push_back(cache_entries_[key]);
             cache_entries_[key] = cache_entry;
-            logger.info("cache entry %s is exists", cache_entry->domain_.c_str());
+            logger.debug("cache entry %s is exists", cache_entry->domain_.c_str());
         }
         else
         {
             cache_entries_[key] = cache_entry;
-            logger.info("add cache entry %s query_domain %s", cache_entry->domain_.c_str(), domain.c_str());
+            logger.debug("add cache entry %s", cache_entry->domain_.c_str());
         }
 
         co_return;
@@ -149,7 +149,7 @@ namespace dns
             dns_cache_entry *cache_entry = it->second;
 
             cache_entry->access_count_++; // Increment access count
-            logger.debug("query cache entry %s query_domain %s", cache_entry->domain_.c_str(), domain.c_str());
+            logger.debug("query cache entry %s", cache_entry->domain_.c_str());
             co_return cache_entry; // Return cache entry
         }
 
@@ -178,7 +178,7 @@ namespace dns
             // Check if cache entry has expired based on ttl
             if (current_time >= cache_entry->create_time_ + cache_entry->ttl_ * 1000)
             {
-                logger.info("remove cache entry %s", cache_entry->domain_.c_str());
+                logger.debug("remove cache entry %s", cache_entry->domain_.c_str());
                 // Add expired cache entry key to the list
                 expired_entries.push_back(entry.first);
             }

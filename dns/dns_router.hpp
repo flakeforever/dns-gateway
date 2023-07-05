@@ -43,7 +43,7 @@ namespace dns
         
         asio::any_io_executor executor_;
         size_t current_index_;
-        std::mutex mutex_;
+        coroutine_mutex mutex_;
     };
 
     class dns_statics
@@ -95,6 +95,6 @@ namespace dns
 
         asio::any_io_executor executor_;
         dns_statics statics_;
-        std::mutex mutex_;
+        coroutine_mutex mutex_;
     };
 }

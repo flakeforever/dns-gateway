@@ -108,47 +108,22 @@ namespace dns
                 // define a coroutine for request
                 auto request_coroutine = [&](dns::dns_object *new_object) -> asio::awaitable<void>
                 {
-                    await_timeout_execute timeout_execute(executor_);
-                    co_await timeout_execute.execute_until(
-                        std::chrono::milliseconds(dns::coroutine_timeout),
-                        [&](asio::steady_timer &timer) -> asio::awaitable<void>
-                        {
-                            try
-                            {
-                                // // handle dns static
-                                // bool status = co_await handle_dns_static(new_object, request_domain, request_type);
-                                // if (status)
-                                // {
-                                //     co_await object_pool_.release_object(new_object);
-                                //     timer.cancel();
-                                //     co_return;
-                                // }
+                    // // handle dns static
+                    // bool status = co_await handle_dns_static(new_object, request_domain, request_type);
+                    // if (status)
+                    // {
+                    //     co_await object_pool_.release_object(new_object);
+                    //     timer.cancel();
+                    //     co_return;
+                    // }
 
-                                // handle dns cache
-                                bool status = co_await handle_query_cache(new_object);
-                                if (!status)
-                                {
-                                    // handle dns request
-                                    co_await handle_dns_request(new_object);
-                                }
-                            }
-                            catch (const std::exception &e)
-                            {
-                                if (!timeout_execute.timeout())
-                                {
-                                    logger.error("request error : %s %s", new_object->question_domain_.c_str(), e.what());
-                                }
-                                else
-                                {
-                                    logger.error("timeout error : %s", new_object->question_domain_.c_str());
-                                }
-                            }
-
-                            if (!timeout_execute.timeout())
-                            {
-                                timer.cancel();
-                            }
-                        });
+                    // handle dns cache
+                    bool status = co_await handle_query_cache(new_object);
+                    if (!status)
+                    {
+                        // handle dns request
+                        co_await handle_dns_request(new_object);
+                    }
 
                     co_await object_pool_.release_object(new_object);
                     co_return;
@@ -251,7 +226,7 @@ namespace dns
             co_return false;
         }
 
-        await_lock lock(executor_, cache_.mutex_);
+        await_coroutine_lock lock(executor_, &cache_.mutex_);
         co_await lock.check_lock();
 
         dns_cache_entry *cache_entry = co_await cache_.get_free_cache();
@@ -276,7 +251,7 @@ namespace dns
         bool status = false;
 
         {
-            await_lock lock(executor_, cache_.mutex_);
+            await_coroutine_lock lock(executor_, &cache_.mutex_);
             co_await lock.check_lock();
 
             dns_cache_entry *cache_entry =
@@ -378,6 +353,10 @@ namespace dns
                     try
                     {
                         status = package.parse(data, data_length);
+                        if (package.id() != current_object->question_id_)
+                        {
+                            package.output();
+                        }
                     }
                     catch (const std::exception &e)
                     {
@@ -420,7 +399,35 @@ namespace dns
         };
 
         // request to upstream
-        co_await dns_upstream->send_request(dns_object->buffer_, dns_object->buffer_length_, handle_response);
+        await_timeout_execute timeout_execute(executor_);
+        co_await timeout_execute.execute_until(
+            std::chrono::milliseconds(dns::coroutine_timeout),
+            [&](asio::steady_timer &timer) -> asio::awaitable<void>
+            {
+                try
+                {
+                    co_await dns_upstream->send_request(dns_object->buffer_, dns_object->buffer_length_, handle_response);
+                }
+                catch (const std::exception &e)
+                {
+                    dns_upstream->close();
+
+                    if (!timeout_execute.timeout())
+                    {
+                        logger.error("request error : %s %s", dns_object->question_domain_.c_str(), e.what());
+                    }
+                    else
+                    {
+                        logger.error("timeout error : %s", dns_object->question_domain_.c_str());
+                    }
+                }
+
+                if (!timeout_execute.timeout())
+                {
+                    timer.cancel();
+                }
+            });
+
         co_return result;
     }
 
@@ -501,6 +508,8 @@ namespace dns
                                         }
                                         catch (const std::exception &e)
                                         {
+                                            upstream->close();
+
                                             if (!timeout_execute.timeout())
                                             {
                                                 logger.error("request error : check upstream");

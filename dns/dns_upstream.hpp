@@ -52,6 +52,7 @@ namespace dns
 
         virtual asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler);
         virtual void set_proxy(socks::proxy_type proxy_type, std::string proxy_host, uint16_t proxy_port);
+        virtual void close();
 
     protected:
         asio::awaitable<void> execute_handler(handle_response handler, std::error_code error, const char *data = nullptr, size_t size = 0);
@@ -60,7 +61,7 @@ namespace dns
         virtual void handle_exception(std::error_code error);
         
         asio::any_io_executor executor_;
-        std::mutex mutex_;
+        coroutine_mutex mutex_;
         char buffer_[dns::buffer_size];
 
     private:
@@ -71,12 +72,13 @@ namespace dns
     public:
         dns_udp_upstream(asio::any_io_executor executor, std::string host, uint16_t port);
 
+        asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler) override;
+        void close() override;
+
+    protected:
         asio::awaitable<bool> associate();
         void release();
 
-        asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler);
-
-    protected:
     private:
         socks::socks_udp_client client_;
     };
@@ -105,12 +107,14 @@ namespace dns
         dns_https_upstream(asio::any_io_executor executor, std::string url);
         ~dns_https_upstream();
 
-        asio::awaitable<bool> connect();
-        void disconnect();
-        asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler);
-        bool is_connected();
+        asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler) override;
+        void close() override;
 
     protected:
+        asio::awaitable<bool> connect();
+        void disconnect();
+        bool is_connected();
+
         void parse_url(std::string url);
         http_header parse_http_header(const std::string &header_string);
         bool check_http_header(http_header header);
@@ -122,5 +126,6 @@ namespace dns
 
         std::string scheme_;
         std::string path_;
+        char buffer_[dns::buffer_size];
     };
 }

@@ -36,6 +36,7 @@ set(DNS_SOURCES
     dns_error.cpp
     dns_gateway.cpp
     dns_log.cpp
+    dns_object.cpp
     dns_package.cpp
     dns_router.cpp
     dns_upstream.cpp

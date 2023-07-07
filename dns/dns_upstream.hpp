@@ -50,9 +50,13 @@ namespace dns
 
         dns_upstream(asio::any_io_executor executor);
 
-        virtual asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler);
+        virtual asio::awaitable<bool> open();
+        virtual asio::awaitable<void> close();
+        virtual asio::awaitable<bool> is_open();
+        virtual asio::awaitable<bool> send_request(const char *data, uint16_t data_length, handle_response handler);
         virtual void set_proxy(socks::proxy_type proxy_type, std::string proxy_host, uint16_t proxy_port);
-        virtual void close();
+        
+        coroutine_mutex mutex_;
 
     protected:
         asio::awaitable<void> execute_handler(handle_response handler, std::error_code error, const char *data = nullptr, size_t size = 0);
@@ -61,7 +65,6 @@ namespace dns
         virtual void handle_exception(std::error_code error);
         
         asio::any_io_executor executor_;
-        coroutine_mutex mutex_;
         char buffer_[dns::buffer_size];
 
     private:
@@ -72,8 +75,10 @@ namespace dns
     public:
         dns_udp_upstream(asio::any_io_executor executor, std::string host, uint16_t port);
 
-        asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler) override;
-        void close() override;
+        asio::awaitable<bool> open() override;
+        asio::awaitable<void> close() override;
+        asio::awaitable<bool> is_open() override;
+        asio::awaitable<bool> send_request(const char *data, uint16_t data_length, handle_response handler) override;
 
     protected:
         asio::awaitable<bool> associate();
@@ -107,8 +112,10 @@ namespace dns
         dns_https_upstream(asio::any_io_executor executor, std::string url);
         ~dns_https_upstream();
 
-        asio::awaitable<void> send_request(const char *data, uint16_t data_length, handle_response handler) override;
-        void close() override;
+        asio::awaitable<bool> open() override;
+        asio::awaitable<void> close() override;
+        asio::awaitable<bool> is_open() override;
+        asio::awaitable<bool> send_request(const char *data, uint16_t data_length, handle_response handler) override;
 
     protected:
         asio::awaitable<bool> connect();

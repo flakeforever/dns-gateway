@@ -32,10 +32,10 @@ namespace dns
         last_request_time_ = asio::steady_timer::clock_type::now();
     }
 
-    asio::awaitable<void> dns_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
+    asio::awaitable<bool> dns_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
     {
         last_request_time_ = asio::steady_timer::clock_type::now();
-        co_return;
+        co_return true;
     }
 
     void dns_upstream::set_proxy(socks::proxy_type proxy_type, std::string proxy_host, uint16_t proxy_port)
@@ -45,9 +45,19 @@ namespace dns
         proxy_port_ = proxy_port;
     }
 
-    void dns_upstream::close()
+    asio::awaitable<bool> dns_upstream::open()
     {
-        
+        co_return true;
+    }
+
+    asio::awaitable<void> dns_upstream::close()
+    {
+        co_return;
+    }
+
+    asio::awaitable<bool> dns_upstream::is_open()
+    {
+        co_return false;
     }
 
     asio::awaitable<void> dns_upstream::execute_handler(handle_response handler, std::error_code error, const char *data, size_t size)
@@ -102,19 +112,10 @@ namespace dns
         client_.release();
     }
 
-    asio::awaitable<void> dns_udp_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
+    asio::awaitable<bool> dns_udp_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
     {
         try
         {
-            await_coroutine_lock lock(executor_, &mutex_);
-            co_await lock.check_lock();
-
-            // check associate status
-            if (!client_.is_associated())
-            {
-                co_await associate();
-            }
-
             // send dns request
             last_request_time_ = asio::steady_timer::clock_type::now();
             int length = co_await client_.send(data, data_length);
@@ -129,17 +130,37 @@ namespace dns
             if (length > 0)
             {
                 co_await execute_handler(handler, errc::error_code::no_error, buffer_, length);
+                co_return true;
             }
         }
         catch(const std::exception& e)
         {
-            release();
+            try
+            {
+                release();
+            }
+            catch(const std::exception& e)
+            {
+            }
         }
+
+        co_return false;
     }
 
-    void dns_udp_upstream::close()
+    asio::awaitable<bool> dns_udp_upstream::open()
+    {
+        co_return co_await associate();
+    }
+
+    asio::awaitable<void> dns_udp_upstream::close()
     {
         release();
+        co_return;
+    }
+
+    asio::awaitable<bool> dns_udp_upstream::is_open()
+    {
+        co_return client_.is_associated();
     }
 
     dns_https_upstream::dns_https_upstream(asio::any_io_executor executor, std::string url)
@@ -172,16 +193,13 @@ namespace dns
     asio::awaitable<bool> dns_https_upstream::connect()
     {
         client_->set_proxy(proxy_type_, proxy_host_, proxy_port_);
-
-        logger.info("dns_https_upstream connect");
+        
         bool status = co_await client_->connect(host_, port_);
-
         co_return status;
     }
 
     void dns_https_upstream::disconnect()
     {
-        logger.info("dns_https_upstream disconnect");
         client_->disconnect();
     }
 
@@ -201,19 +219,10 @@ namespace dns
         return nullptr;
     }
 
-    asio::awaitable<void> dns_https_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
+    asio::awaitable<bool> dns_https_upstream::send_request(const char *data, uint16_t data_length, handle_response handler)
     {
         try
         {
-            await_coroutine_lock lock(executor_, &mutex_);
-            co_await lock.check_lock();
-
-            // check connection status
-            if (!client_->is_connected())
-            {
-                co_await connect();
-            }
-
             // send dns request
             last_request_time_ = asio::steady_timer::clock_type::now();
             std::string request = "POST " + path_ + " HTTP/1.1\r\n"
@@ -248,6 +257,7 @@ namespace dns
                     if (data_length == header.content_length)
                     {
                         co_await execute_handler(handler, errc::error_code::no_error, header_end, data_length);
+                        co_return true;
                     }
                     else
                     {
@@ -262,13 +272,32 @@ namespace dns
         }
         catch(const std::exception& e)
         {
-            disconnect();
+            try
+            {
+                disconnect();
+            }
+            catch(const std::exception& e)
+            {
+            }
         }
+
+        co_return false;
     }
 
-    void dns_https_upstream::close()
+    asio::awaitable<bool> dns_https_upstream::open()
+    {
+        co_return co_await connect();
+    }
+
+    asio::awaitable<void> dns_https_upstream::close()
     {
         disconnect();
+        co_return;
+    }
+
+    asio::awaitable<bool> dns_https_upstream::is_open()
+    {
+        co_return client_->is_connected();
     }
 
     http_header dns_https_upstream::parse_http_header(const std::string &header_string)

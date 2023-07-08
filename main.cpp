@@ -290,17 +290,8 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway, config::dns_config
                 udp_upstream->check_enabled(upstream.check_enabled);
                 udp_upstream->check_interval(upstream.check_interval);
 
-                bool status = co_await udp_upstream->open();
-
-                if (status)
-                {
-                    upstream_group->add_upstream(udp_upstream);
-                    gateway->upstreams_.push_back(udp_upstream);
-                }
-                else
-                {
-                    dns::logger.error("create upstream failed: %s", upstream.uri.c_str());
-                }
+                upstream_group->add_upstream(udp_upstream);
+                gateway->upstreams_.push_back(udp_upstream);
             }
             else if (uri.scheme() == "doh")
             {
@@ -321,17 +312,8 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway, config::dns_config
                 https_upstream->check_enabled(upstream.check_enabled);
                 https_upstream->check_interval(upstream.check_interval);
 
-                bool status = co_await https_upstream->open();
-
-                if (status)
-                {
-                    upstream_group->add_upstream(https_upstream);
-                    gateway->upstreams_.push_back(https_upstream);
-                }
-                else
-                {
-                    dns::logger.error("create upstream failed: %s", upstream.uri.c_str());
-                }
+                upstream_group->add_upstream(https_upstream);
+                gateway->upstreams_.push_back(https_upstream);
             }
         }
     }

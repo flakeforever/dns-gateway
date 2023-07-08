@@ -56,7 +56,7 @@ namespace dns
         virtual asio::awaitable<bool> send_request(const char *data, uint16_t data_length, handle_response handler);
         virtual void set_proxy(socks::proxy_type proxy_type, std::string proxy_host, uint16_t proxy_port);
 
-        coroutine_mutex mutex_;
+        std::atomic_bool locked_ = false;
 
     protected:
         asio::awaitable<void> execute_handler(handle_response handler, std::error_code error, const char *data = nullptr, size_t size = 0);

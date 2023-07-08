@@ -122,7 +122,7 @@ namespace dns
                             co_await handle_dns_request(new_object);
                         }
                     }
-                    
+
                     co_await object_pool_.release_object(new_object);
                     co_return;
                 };
@@ -180,61 +180,67 @@ namespace dns
 
     asio::awaitable<bool> dns_gateway::handle_dns_static(dns::dns_object *dns_object)
     {
-        // check domain static
-        std::vector<std::string> static_values =
-            co_await statics_.get_static_values(
-                dns_object->question_domain_, static_cast<dns::anwser_type>(dns_object->question_type_));
+        std::vector<std::string> static_values;
 
-        if (static_values.size() > 0)
         {
-            dns::dns_package package;
-            try
-            {
-                package.parse(dns_object->buffer_, dns_object->buffer_length_);
-            }
-            catch (const std::exception &e)
-            {
-                co_return false;
-            }
+            await_coroutine_lock lock(executor_, statics_.locked_);
+            co_await lock.check_lock();
 
-            if (package.flag_qr() != static_cast<uint8_t>(dns::qr_type::request) ||
-                package.que_count() > 1)
-            {
-                co_return false;
-            }
+            // check domain static
+            static_values =
+                co_await statics_.get_static_values(
+                    dns_object->question_domain_, static_cast<dns::anwser_type>(dns_object->question_type_));
+        }
 
-            package.set_ttl(3600);
+        if (static_values.size() == 0)
+        {
+            co_return false;
+        }
 
+        dns::dns_package package;
+        try
+        {
+            package.parse(dns_object->buffer_, dns_object->buffer_length_);
+        }
+        catch (const std::exception &e)
+        {
+            co_return false;
+        }
+
+        if (package.flag_qr() != static_cast<uint8_t>(dns::qr_type::request) ||
+            package.que_count() > 1)
+        {
+            co_return false;
+        }
+
+        try
+        {
             for (auto value : static_values)
             {
                 package.add_anwser(
                     dns_object->question_domain_, static_cast<dns::anwser_type>(dns_object->question_type_), value);
             }
 
-            try
-            {
-                dns_object->buffer_length_ = package.dump(dns_object->buffer_, sizeof(dns_object->buffer_));
-            }
-            catch (const std::exception &e)
-            {
-                logger.error("package dump error: %s", e.what());
-                co_return false;
-            }
-
-            if (dns_object->buffer_length_ == 0)
-            {
-                logger.error("package dump: buffer_length_ == 0");
-                co_return false;
-            }
-
-            co_await udp_socket_.async_send_to(
-                asio::buffer(dns_object->buffer_, dns_object->buffer_length_),
-                dns_object->remote_endpoint_,
-                asio::use_awaitable);
-            co_return true;
+            dns_object->buffer_length_ = package.dump(dns_object->buffer_, sizeof(dns_object->buffer_));
+        }
+        catch (const std::exception &e)
+        {
+            logger.error("package dump error: %s", e.what());
+            co_return false;
         }
 
-        co_return false;
+        if (dns_object->buffer_length_ == 0)
+        {
+            logger.error("package dump: buffer_length_ == 0");
+            co_return false;
+        }
+
+        co_await udp_socket_.async_send_to(
+            asio::buffer(dns_object->buffer_, dns_object->buffer_length_),
+            dns_object->remote_endpoint_,
+            asio::use_awaitable);
+
+        co_return true;
     }
 
     asio::awaitable<bool> dns_gateway::handle_create_cache(dns::dns_object *dns_object)
@@ -257,7 +263,7 @@ namespace dns
             co_return false;
         }
 
-        await_coroutine_lock lock(executor_, &cache_.mutex_);
+        await_coroutine_lock lock(executor_, cache_.locked_);
         co_await lock.check_lock();
 
         dns_cache_entry *cache_entry = co_await cache_.get_free_cache();
@@ -282,7 +288,7 @@ namespace dns
         bool status = false;
 
         {
-            await_coroutine_lock lock(executor_, &cache_.mutex_);
+            await_coroutine_lock lock(executor_, cache_.locked_);
             co_await lock.check_lock();
 
             dns_cache_entry *cache_entry =
@@ -447,7 +453,7 @@ namespace dns
             {
                 try
                 {
-                    await_coroutine_lock lock(executor_, &dns_upstream->mutex_);
+                    await_coroutine_lock lock(executor_, dns_upstream->locked_);
                     co_await lock.check_lock();
 
                     bool status = co_await dns_upstream->is_open();
@@ -502,7 +508,7 @@ namespace dns
             {
                 try
                 {
-                    await_coroutine_lock lock(executor_, &dns_upstream->mutex_);
+                    await_coroutine_lock lock(executor_, dns_upstream->locked_);
                     co_await lock.check_lock();
 
                     co_await dns_upstream->close();
@@ -595,7 +601,7 @@ namespace dns
                                     {
                                         try
                                         {
-                                            await_coroutine_lock lock(executor_, &dns_upstream->mutex_);
+                                            await_coroutine_lock lock(executor_, dns_upstream->locked_);
                                             co_await lock.check_lock();
 
                                             bool status = co_await dns_upstream->is_open();

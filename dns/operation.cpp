@@ -65,15 +65,12 @@ asio::awaitable<void> await_lock::check_lock()
 
 asio::awaitable<void> await_lock::wait(std::chrono::milliseconds duration)
 {
-    auto now = std::chrono::steady_clock::now();
-    auto deadline = now + duration;
-
-    timer_.expires_at(deadline);
+    timer_.expires_after(duration);
     co_await timer_.async_wait(asio::use_awaitable);
 }
 
-await_coroutine_lock::await_coroutine_lock(asio::any_io_executor executor, coroutine_mutex *mutex)
-    : mutex_(mutex), await_lock_(executor, mutex->mutex_), timer_(executor)
+await_coroutine_lock::await_coroutine_lock(asio::any_io_executor executor, std::atomic_bool &locked)
+    : locked_(locked), timer_(executor)
 {
     own_lock_ = false;
 }
@@ -82,16 +79,21 @@ await_coroutine_lock::~await_coroutine_lock()
 {
     if (own_lock_)
     {
-        mutex_->locked_.store(false, std::memory_order_seq_cst);
+        locked_.store(false, std::memory_order_release);
     }
 }
 
 asio::awaitable<void> await_coroutine_lock::check_lock()
 {
-    co_await await_lock_.check_lock();
-    while (mutex_->locked_.exchange(true))
+    while (true)
     {
-        co_await wait(std::chrono::milliseconds(check_interval));
+        if (!locked_.exchange(true, std::memory_order_acquire))
+            break;
+
+        while (locked_.load(std::memory_order_relaxed))
+        {
+            co_await wait(std::chrono::milliseconds(check_interval));
+        }
     }
 
     own_lock_ = true;
@@ -100,10 +102,7 @@ asio::awaitable<void> await_coroutine_lock::check_lock()
 
 asio::awaitable<void> await_coroutine_lock::wait(std::chrono::milliseconds duration)
 {
-    auto now = std::chrono::steady_clock::now();
-    auto deadline = now + std::chrono::milliseconds(duration);
-
-    timer_.expires_at(deadline);
+    timer_.expires_after(duration);
     co_await timer_.async_wait(asio::use_awaitable);
 }
 

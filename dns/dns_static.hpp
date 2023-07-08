@@ -30,12 +30,13 @@ namespace dns
         asio::awaitable<std::vector<std::string>> get_static_values(
             const std::string &domain, dns::anwser_type type);
 
+        std::atomic_bool locked_ = false;
+        
     private:
         std::string generate_key(const std::string &domain, dns::anwser_type type);
 
         std::map<std::string, std::vector<std::string>> static_values_;
 
         asio::any_io_executor executor_;
-        coroutine_mutex mutex_;
     };
 }

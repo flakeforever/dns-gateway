@@ -44,7 +44,7 @@ namespace dns
         
         asio::any_io_executor executor_;
         size_t current_index_;
-        coroutine_mutex mutex_;
+        std::atomic_bool locked_ = false;
     };
 
     class dns_router
@@ -82,6 +82,6 @@ namespace dns
         uint8_t next_group_id_ = 1;
 
         asio::any_io_executor executor_;
-        coroutine_mutex mutex_;
+        std::atomic_bool locked_ = false;
     };
 }

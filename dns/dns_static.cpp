@@ -29,9 +29,6 @@ namespace dns
     asio::awaitable<std::vector<std::string>> dns_statics::get_static_values(
         const std::string &domain, dns::anwser_type type)
     {
-        await_coroutine_lock lock(executor_, &mutex_);
-        co_await lock.check_lock();
-
         std::string key = generate_key(domain, type);
 
         auto it = static_values_.find(key);

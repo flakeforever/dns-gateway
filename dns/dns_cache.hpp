@@ -58,7 +58,7 @@ namespace dns
         asio::awaitable<void> add_cache(const std::string& domain, uint8_t type, dns_cache_entry* cache_entry);
         asio::awaitable<dns_cache_entry*> query_cache(const std::string& domain, uint8_t type);
 
-        coroutine_mutex mutex_;
+        std::atomic_bool locked_ = false;
 
     private:
         std::string generate_key(const std::string& domain, uint8_t type);

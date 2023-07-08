@@ -203,7 +203,7 @@ namespace dns
         client_->disconnect();
     }
 
-    char* search_substring(char* buffer, std::size_t buffer_length, const char* substring)
+    char *dns_https_upstream::search_substring(char *buffer, std::size_t buffer_length, const char *substring)
     {
         std::size_t substring_length = std::strlen(substring);
 

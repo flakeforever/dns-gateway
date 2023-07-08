@@ -55,7 +55,7 @@ namespace dns
         virtual asio::awaitable<bool> is_open();
         virtual asio::awaitable<bool> send_request(const char *data, uint16_t data_length, handle_response handler);
         virtual void set_proxy(socks::proxy_type proxy_type, std::string proxy_host, uint16_t proxy_port);
-        
+
         coroutine_mutex mutex_;
 
     protected:
@@ -63,7 +63,7 @@ namespace dns
         asio::awaitable<void> execute_handler(handle_response handler, std::system_error error, const char *data = nullptr, size_t size = 0);
         asio::awaitable<void> execute_handler(handle_response handler, dns::errc::error_code error, const char *data = nullptr, size_t size = 0);
         virtual void handle_exception(std::error_code error);
-        
+
         asio::any_io_executor executor_;
         char buffer_[dns::buffer_size];
 
@@ -125,6 +125,7 @@ namespace dns
         void parse_url(std::string url);
         http_header parse_http_header(const std::string &header_string);
         bool check_http_header(http_header header);
+        char *search_substring(char *buffer, std::size_t buffer_length, const char *substring);
         void handle_exception(std::error_code error) override;
 
     private:

@@ -13,44 +13,6 @@
 
 #include "operation.hpp"
 
-semaphore_object::semaphore_object()
-{
-}
-
-semaphore::semaphore()
-{
-}
-
-void semaphore::add_object(std::shared_ptr<semaphore_object> obj)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    objects_.push_back(obj);
-}
-
-std::shared_ptr<semaphore_object> semaphore::get_object()
-{
-    std::unique_lock<std::mutex> lock(mutex_);
-    condition_.wait(lock, [this]
-                    { return !objects_.empty(); });
-
-    auto obj = objects_.back();
-    objects_.pop_back();
-
-    return obj;
-}
-
-void semaphore::notify(std::shared_ptr<semaphore_object> obj)
-{
-    // obj->cancel_timer(); // Cancel the timer for the object
-    // obj->print_elapsed_time(); // Print the elapsed time
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        objects_.push_back(obj);
-    }
-
-    condition_.notify_one();
-}
-
 await_wait::await_wait(asio::any_io_executor executor)
     : timer_(executor)
 {
@@ -86,8 +48,66 @@ asio::awaitable<void> await_wait::wait(std::chrono::milliseconds duration)
 }
 
 await_lock::await_lock(asio::any_io_executor executor, std::mutex &mutex)
-    : lock_(mutex, std::try_to_lock), timer_(executor)
+    : lock_(mutex), timer_(executor)
 {
+}
+
+asio::awaitable<void> await_lock::check_lock()
+{
+    while (!lock_.owns_lock())
+    {
+        co_await wait(std::chrono::milliseconds(10));
+        lock_.try_lock();
+    }
+
+    co_return;
+}
+
+asio::awaitable<void> await_lock::wait(std::chrono::milliseconds duration)
+{
+    auto now = std::chrono::steady_clock::now();
+    auto deadline = now + duration;
+
+    timer_.expires_at(deadline);
+    co_await timer_.async_wait(asio::use_awaitable);
+}
+
+await_coroutine_lock::await_coroutine_lock(asio::any_io_executor executor, coroutine_mutex *mutex)
+    : mutex_(mutex), await_lock_(executor, mutex->mutex_), timer_(executor)
+{
+    own_lock_ = false;
+}
+
+await_coroutine_lock::~await_coroutine_lock()
+{
+    if (own_lock_)
+    {
+        mutex_->access_count_.store(0, std::memory_order_relaxed);
+    }
+}
+
+asio::awaitable<void> await_coroutine_lock::check_lock()
+{
+    co_await await_lock_.check_lock();
+
+    while (mutex_->access_count_.load(std::memory_order_relaxed) != 0)
+    {
+        co_await wait(std::chrono::milliseconds(10));
+    }
+
+    mutex_->access_count_.store(1, std::memory_order_relaxed);
+    own_lock_ = true;
+
+    co_return;
+}
+
+asio::awaitable<void> await_coroutine_lock::wait(std::chrono::milliseconds duration)
+{
+    auto now = std::chrono::steady_clock::now();
+    auto deadline = now + std::chrono::milliseconds(duration);
+
+    timer_.expires_at(deadline);
+    co_await timer_.async_wait(asio::use_awaitable);
 }
 
 await_timeout_execute::await_timeout_execute(asio::any_io_executor executor)

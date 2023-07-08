@@ -27,29 +27,6 @@
 using namespace asio;
 using namespace asio::experimental::awaitable_operators;
 
-class semaphore_object : public std::enable_shared_from_this<semaphore_object>
-{
-public:
-    semaphore_object();
-
-private:
-};
-
-class semaphore
-{
-public:
-    explicit semaphore();
-
-    void add_object(std::shared_ptr<semaphore_object> obj);
-    std::shared_ptr<semaphore_object> get_object();
-    void notify(std::shared_ptr<semaphore_object> obj);
-
-private:
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    std::vector<std::shared_ptr<semaphore_object>> objects_;
-};
-
 class await_wait
 {
 public:
@@ -71,35 +48,20 @@ class coroutine_mutex
 {
 public:
     std::mutex mutex_;
-    int access_count_ = 0;
+    std::atomic<int> access_count_;
 };
 
 class await_lock
 {
 public:
-    await_lock(asio::any_io_executor executor, std::mutex &mutex);
+    await_lock(asio::any_io_executor executor, std::mutex& mutex);
 
-    asio::awaitable<void> check_lock()
-    {
-        while (!lock_.owns_lock())
-        {
-            co_await wait(std::chrono::milliseconds(10));
-            lock_.try_lock();
-        }
+    asio::awaitable<void> check_lock();
 
-        co_return;
-    };
-    
     std::unique_lock<std::mutex> lock_;
-private:
-    asio::awaitable<void> wait(std::chrono::milliseconds duration)
-    {
-        auto now = std::chrono::steady_clock::now();
-        auto deadline = now + duration;
 
-        timer_.expires_at(deadline);
-        co_await timer_.async_wait(asio::use_awaitable);
-    };
+private:
+    asio::awaitable<void> wait(std::chrono::milliseconds duration);
 
     asio::steady_timer timer_;
 };
@@ -107,43 +69,18 @@ private:
 class await_coroutine_lock
 {
 public:
-    await_coroutine_lock(asio::any_io_executor executor, coroutine_mutex *mutex)
-        :await_lock_(executor, mutex->mutex_), timer_(executor)
-    {
-        mutex_ = mutex;
-    }
+    await_coroutine_lock(asio::any_io_executor executor, coroutine_mutex* mutex);
+    ~await_coroutine_lock();
 
-    ~await_coroutine_lock()
-    {
-        mutex_->access_count_--;
-    }
-
-    asio::awaitable<void> check_lock()
-    {
-        co_await await_lock_.check_lock();
-
-        while (mutex_->access_count_ != 0)
-        {
-            co_await wait(std::chrono::milliseconds(10));
-        }
-
-        mutex_->access_count_++;
-        co_return;
-    }; 
+    asio::awaitable<void> check_lock();
 
 private:
-    asio::awaitable<void> wait(std::chrono::milliseconds duration)
-    {
-        auto now = std::chrono::steady_clock::now();
-        auto deadline = now + std::chrono::milliseconds(duration);
+    asio::awaitable<void> wait(std::chrono::milliseconds duration);
 
-        timer_.expires_at(deadline);
-        co_await timer_.async_wait(asio::use_awaitable);
-    };
-
-    coroutine_mutex *mutex_;
+    coroutine_mutex* mutex_;
     await_lock await_lock_;
     asio::steady_timer timer_;
+    bool own_lock_;
 };
 
 class await_timeout_execute

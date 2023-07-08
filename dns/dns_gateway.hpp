@@ -69,6 +69,11 @@ namespace dns
         asio::awaitable<bool> handle_dns_request(dns::dns_object *dns_object);
 
     private:
+        asio::awaitable<bool> dns_upstream_request(
+            std::shared_ptr<dns_upstream> dns_upstream, dns::dns_object *dns_object);
+        asio::awaitable<void> dns_upstream_close(
+            std::shared_ptr<dns_upstream> dns_upstream);
+            
         asio::any_io_executor executor_;
         uint16_t port_;
         asio::ip::udp::socket udp_socket_;

@@ -27,6 +27,8 @@
 using namespace asio;
 using namespace asio::experimental::awaitable_operators;
 
+constexpr int check_interval = 10;
+
 class await_wait
 {
 public:

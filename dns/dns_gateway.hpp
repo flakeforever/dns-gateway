@@ -20,6 +20,7 @@
 #include "dns_object.hpp"
 #include "dns_package.hpp"
 #include "dns_router.hpp"
+#include "dns_static.hpp"
 #include "dns_upstream.hpp"
 #include "operation.hpp"
 #include "property.hpp"
@@ -50,6 +51,7 @@ namespace dns
         asio::awaitable<void> run_process();
 
         dns_router &get_router();
+        dns_statics &get_statics();
         dns_cache &get_cache();
 
         asio::awaitable<void> wait_terminated();
@@ -62,8 +64,7 @@ namespace dns
         void start_checker();
         asio::awaitable<int> do_receive();
         void set_active(const bool &value) override;
-        asio::awaitable<bool> handle_dns_static(
-            std::shared_ptr<dns::dns_object> dns_object, std::string request_domain, dns::anwser_type request_type);
+        asio::awaitable<bool> handle_dns_static(dns::dns_object *dns_object);
         asio::awaitable<bool> handle_query_cache(dns::dns_object *dns_object);
         asio::awaitable<bool> handle_create_cache(dns::dns_object *dns_object);
         asio::awaitable<bool> handle_dns_request(dns::dns_object *dns_object);
@@ -81,6 +82,7 @@ namespace dns
         asio::ip::udp::endpoint remote_endpoint_;
 
         dns_router router_;
+        dns_statics statics_;
         dns_cache cache_;
         char buffer_[dns::buffer_size];
         int object_id_;

@@ -39,6 +39,7 @@ set(DNS_SOURCES
     dns_object.cpp
     dns_package.cpp
     dns_router.cpp
+    dns_static.cpp
     dns_upstream.cpp
 )
 

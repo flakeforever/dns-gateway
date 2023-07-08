@@ -328,22 +328,22 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway, config::dns_config
         {
             if (static_entry.type == "A")
             {
-                gateway->get_router().get_statics().add_static_value(
+                gateway->get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::a, static_entry.value);
             }
             if (static_entry.type == "AAAA")
             {
-                gateway->get_router().get_statics().add_static_value(
+                gateway->get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::aaaa, static_entry.value);
             }
             if (static_entry.type == "CNAME")
             {
-                gateway->get_router().get_statics().add_static_value(
+                gateway->get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::cname, static_entry.value);
             }
             if (static_entry.type == "TXT")
             {
-                gateway->get_router().get_statics().add_static_value(
+                gateway->get_statics().add_static_value(
                     static_entry.domain, dns::anwser_type::txt, static_entry.value);
             }
         }

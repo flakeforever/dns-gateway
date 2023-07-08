@@ -56,7 +56,7 @@ asio::awaitable<void> await_lock::check_lock()
 {
     while (!lock_.owns_lock())
     {
-        co_await wait(std::chrono::milliseconds(10));
+        co_await wait(std::chrono::milliseconds(check_interval));
         lock_.try_lock();
     }
 
@@ -92,7 +92,7 @@ asio::awaitable<void> await_coroutine_lock::check_lock()
 
     while (mutex_->access_count_.load(std::memory_order_relaxed) != 0)
     {
-        co_await wait(std::chrono::milliseconds(10));
+        co_await wait(std::chrono::milliseconds(check_interval));
     }
 
     mutex_->access_count_.store(1, std::memory_order_relaxed);

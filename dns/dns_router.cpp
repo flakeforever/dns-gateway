@@ -45,32 +45,6 @@ namespace dns
         }
     }
 
-    void dns_statics::add_static_value(const std::string &domain, dns::anwser_type type, const std::string &value)
-    {
-        std::string key = generate_key(domain, type);
-        static_values_[key].push_back(value);
-    }
-
-    std::vector<std::string> dns_statics::get_static_values(const std::string &domain, dns::anwser_type type)
-    {
-        std::string key = generate_key(domain, type);
-
-        auto it = static_values_.find(key);
-        if (it != static_values_.end())
-        {
-            return it->second;
-        }
-        else
-        {
-            return {};
-        }
-    }
-
-    std::string dns_statics::generate_key(const std::string &domain, dns::anwser_type type)
-    {
-        return domain + "_" + std::to_string(static_cast<int>(type));
-    }
-
     dns_router::dns_router(asio::any_io_executor executor)
         : executor_(executor)
     {
@@ -117,10 +91,10 @@ namespace dns
         co_return search_in_trie(root_, domain);
     }
 
-    dns_statics &dns_router::get_statics()
-    {
-        return statics_;
-    }
+    // dns_statics &dns_router::get_statics()
+    // {
+    //     return statics_;
+    // }
 
     uint8_t dns_router::get_next_group_id()
     {

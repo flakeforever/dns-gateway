@@ -20,6 +20,7 @@
 #include <mutex>
 #include "dns_upstream.hpp"
 #include "dns_package.hpp"
+#include "operation.hpp"
 
 namespace dns
 {
@@ -46,17 +47,18 @@ namespace dns
         coroutine_mutex mutex_;
     };
 
-    class dns_statics
-    {
-    public:
-        void add_static_value(const std::string &domain, dns::anwser_type type, const std::string &value);
-        std::vector<std::string> get_static_values(const std::string &domain, dns::anwser_type type);
+    // class dns_statics
+    // {
+    // public:
+    //     void add_static_value(const std::string &domain, dns::anwser_type type, const std::string &value);
+    //     std::vector<std::string> get_static_values(const std::string &domain, dns::anwser_type type);
 
-    private:
-        std::string generate_key(const std::string &domain, dns::anwser_type type);
+    // private:
+    //     std::string generate_key(const std::string &domain, dns::anwser_type type);
 
-        std::map<std::string, std::vector<std::string>> static_values_;
-    };
+    //     std::map<std::string, std::vector<std::string>> static_values_;
+    //     coroutine_mutex mutex_;
+    // };
 
     class dns_router
     {
@@ -72,7 +74,7 @@ namespace dns
         // get upstream group id by domain
         asio::awaitable<uint8_t> get_route(const std::string &domain);
 
-        dns_statics &get_statics();
+        // dns_statics &get_statics();
         std::shared_ptr<dns_upstream_group> default_group;
 
     private:
@@ -94,7 +96,7 @@ namespace dns
         uint8_t next_group_id_ = 1;
 
         asio::any_io_executor executor_;
-        dns_statics statics_;
+        // dns_statics statics_;
         coroutine_mutex mutex_;
     };
 }

@@ -122,7 +122,7 @@ namespace dns
                             co_await handle_dns_request(new_object);
                         }
                     }
-
+                    
                     co_await object_pool_.release_object(new_object);
                     co_return;
                 };

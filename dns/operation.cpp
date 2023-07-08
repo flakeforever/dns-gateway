@@ -82,22 +82,19 @@ await_coroutine_lock::~await_coroutine_lock()
 {
     if (own_lock_)
     {
-        mutex_->access_count_.store(0, std::memory_order_relaxed);
+        mutex_->locked_.store(false, std::memory_order_seq_cst);
     }
 }
 
 asio::awaitable<void> await_coroutine_lock::check_lock()
 {
     co_await await_lock_.check_lock();
-
-    while (mutex_->access_count_.load(std::memory_order_relaxed) != 0)
+    while (mutex_->locked_.exchange(true))
     {
         co_await wait(std::chrono::milliseconds(check_interval));
     }
 
-    mutex_->access_count_.store(1, std::memory_order_relaxed);
     own_lock_ = true;
-
     co_return;
 }
 

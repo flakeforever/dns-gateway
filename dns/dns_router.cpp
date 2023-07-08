@@ -90,12 +90,7 @@ namespace dns
 
         co_return search_in_trie(root_, domain);
     }
-
-    // dns_statics &dns_router::get_statics()
-    // {
-    //     return statics_;
-    // }
-
+    
     uint8_t dns_router::get_next_group_id()
     {
         return next_group_id_++;

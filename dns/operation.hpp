@@ -50,7 +50,7 @@ class coroutine_mutex
 {
 public:
     std::mutex mutex_;
-    std::atomic<int> access_count_;
+    std::atomic_bool locked_ = false;
 };
 
 class await_lock

@@ -23,8 +23,12 @@ namespace config
     struct dns_upstream
     {
         std::string uri;
+        bool security_verify = false;
+        std::string ca_certificate = "";
+        std::string certificate = "";
+        std::string private_key = "";
         std::string proxy;
-        bool keep_alive = false;
+        // bool keep_alive = false;
         bool check_enabled = false;
         int check_interval = 0;
     };

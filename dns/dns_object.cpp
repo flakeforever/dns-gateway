@@ -33,7 +33,7 @@ namespace dns
     asio::awaitable<dns_object *> dns_object_pool::get_object()
     {
         await_coroutine_lock lock(executor_, locked_);
-        co_await lock.check_lock();
+        co_await lock.get_lock();
 
         // Check if there is an available object in static_objects_
         if (!static_objects_.empty())
@@ -59,7 +59,7 @@ namespace dns
     asio::awaitable<void> dns_object_pool::release_object(dns_object *object)
     {
         await_coroutine_lock lock(executor_, locked_);
-        co_await lock.check_lock();
+        co_await lock.get_lock();
 
         // Remove the object from active_objects_
         active_objects_.erase(std::remove(active_objects_.begin(), active_objects_.end(), object), active_objects_.end());

@@ -133,13 +133,13 @@ namespace dns
                 co_return true;
             }
         }
-        catch(const std::exception& e)
+        catch (const std::exception &e)
         {
             try
             {
                 release();
             }
-            catch(const std::exception& e)
+            catch (const std::exception &e)
             {
             }
         }
@@ -163,19 +163,16 @@ namespace dns
         co_return client_.is_associated();
     }
 
-    dns_https_upstream::dns_https_upstream(asio::any_io_executor executor, std::string url)
-        : dns_upstream(executor)
+    dns_tls_upstream::dns_tls_upstream(asio::any_io_executor executor, std::string host, uint16_t port)
+        : dns_upstream(executor), executor_(executor)
     {
-        tls_context_ = new asio::ssl::context(asio::ssl::context::tlsv13_client);
-        tls_context_->load_verify_file("/etc/ssl/certs/ca-certificates.crt");
+        host_ = host;
+        port_ = port;
 
-        client_ = std::make_shared<socks::socks_tls_client>(executor, *tls_context_);
-        keep_alive_ = false;
-
-        parse_url(url);
+        client_ = nullptr;
     }
 
-    dns_https_upstream::~dns_https_upstream()
+    dns_tls_upstream::~dns_tls_upstream()
     {
         disconnect();
 
@@ -185,22 +182,135 @@ namespace dns
         }
     }
 
-    bool dns_https_upstream::is_connected()
+    asio::awaitable<bool> dns_tls_upstream::open()
     {
-        return client_->is_connected();
+        if (client_ == nullptr)
+        {
+            create_client();
+        }
+
+        co_return co_await connect();
     }
 
-    asio::awaitable<bool> dns_https_upstream::connect()
+    asio::awaitable<void> dns_tls_upstream::close()
+    {
+        disconnect();
+        co_return;
+    }
+
+    asio::awaitable<bool> dns_tls_upstream::is_open()
+    {
+        if (client_ == nullptr)
+            co_return false;
+
+        co_return is_connected();
+    }
+
+    asio::awaitable<bool> dns_tls_upstream::send_request(
+        const char *data, uint16_t data_length, handle_response handler)
+    {
+        try
+        {
+            // send dns request
+            last_request_time_ = asio::steady_timer::clock_type::now();
+
+            dns_buffer request_buffer((uint8_t *)buffer_, sizeof(buffer_));
+            request_buffer.write_16bits(data_length);
+            request_buffer.write_buffer(data, data_length);
+
+            co_await client_->write(request_buffer.data(), request_buffer.size());
+
+            int buffer_length = co_await client_->get_socket().async_read_some(
+                asio::buffer(buffer_, sizeof(buffer_)), asio::use_awaitable);
+
+            if (buffer_length > 0)
+            {
+                dns_buffer response_buffer((uint8_t *)buffer_, buffer_length);
+                uint16_t response_length = response_buffer.read_16bits();
+
+                co_await execute_handler(handler, errc::error_code::no_error, response_buffer.data() + 2, response_length);
+                co_return true;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            try
+            {
+                disconnect();
+            }
+            catch (const std::exception &e)
+            {
+            }
+        }
+
+        co_return false;
+    }
+
+    void dns_tls_upstream::create_client()
+    {
+        tls_context_ = new asio::ssl::context(asio::ssl::context::tlsv13_client);
+
+        if (security_verify_)
+        {
+            if (ca_certificate_ != "")
+            {
+                tls_context_->load_verify_file(ca_certificate_);
+            }
+            else
+            {
+                tls_context_->load_verify_file("/etc/ssl/certs/ca-certificates.crt");
+            }
+
+            tls_context_->set_verify_mode(SSL_VERIFY_PEER);
+        }
+        else
+        {
+            tls_context_->set_verify_mode(SSL_VERIFY_NONE);
+        }
+
+        if (certificate_ != "")
+        {
+            tls_context_->use_certificate_file(certificate_, asio::ssl::context::pem);
+        }
+
+        if (private_key_ != "")
+        {
+            tls_context_->use_private_key_file(private_key_, asio::ssl::context::pem);
+        }
+
+        client_ = std::make_shared<socks::socks_tls_client>(executor_, *tls_context_);
+    }
+
+    asio::awaitable<bool> dns_tls_upstream::connect()
     {
         client_->set_proxy(proxy_type_, proxy_host_, proxy_port_);
-        
+
         bool status = co_await client_->connect(host_, port_);
         co_return status;
     }
 
-    void dns_https_upstream::disconnect()
+    void dns_tls_upstream::dns_tls_upstream::disconnect()
     {
         client_->disconnect();
+    }
+
+    bool dns_tls_upstream::is_connected()
+    {
+        return client_->is_connected();
+    }
+
+    void dns_tls_upstream::handle_exception(std::error_code error)
+    {
+        if (error)
+        {
+            disconnect();
+        }
+    }
+
+    dns_https_upstream::dns_https_upstream(asio::any_io_executor executor, std::string host, uint16_t port, std::string url)
+        : dns_tls_upstream(executor, host, port)
+    {
+        parse_url(url);
     }
 
     char *dns_https_upstream::search_substring(char *buffer, std::size_t buffer_length, const char *substring)
@@ -243,7 +353,7 @@ namespace dns
             int buffer_length = co_await client_->get_socket().async_read_some(
                 asio::buffer(buffer_, sizeof(buffer_)), asio::use_awaitable);
 
-            char* header_end = search_substring(buffer_, buffer_length, "\r\n\r\n");
+            char *header_end = search_substring(buffer_, buffer_length, "\r\n\r\n");
             if (header_end != buffer_ + buffer_length)
             {
                 // Calculate the length of the data after the header
@@ -270,34 +380,18 @@ namespace dns
                 }
             }
         }
-        catch(const std::exception& e)
+        catch (const std::exception &e)
         {
             try
             {
                 disconnect();
             }
-            catch(const std::exception& e)
+            catch (const std::exception &e)
             {
             }
         }
 
         co_return false;
-    }
-
-    asio::awaitable<bool> dns_https_upstream::open()
-    {
-        co_return co_await connect();
-    }
-
-    asio::awaitable<void> dns_https_upstream::close()
-    {
-        disconnect();
-        co_return;
-    }
-
-    asio::awaitable<bool> dns_https_upstream::is_open()
-    {
-        co_return client_->is_connected();
     }
 
     http_header dns_https_upstream::parse_http_header(const std::string &header_string)
@@ -382,14 +476,6 @@ namespace dns
         }
 
         return true;
-    }
-
-    void dns_https_upstream::handle_exception(std::error_code error)
-    {
-        if (error)
-        {
-            disconnect();
-        }
     }
 
     void dns_https_upstream::parse_url(std::string url)

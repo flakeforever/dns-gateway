@@ -88,6 +88,40 @@ namespace dns
         socks::socks_udp_client client_;
     };
 
+    class dns_tls_property
+    {
+        PROPERTY_READWRITE(bool, security_verify);
+        PROPERTY_READWRITE(std::string, ca_certificate);
+        PROPERTY_READWRITE(std::string, certificate);
+        PROPERTY_READWRITE(std::string, private_key);
+    };
+
+    class dns_tls_upstream : public dns_tls_property, public dns_upstream
+    {
+    public:
+        dns_tls_upstream(asio::any_io_executor executor, std::string host, uint16_t port);
+        ~dns_tls_upstream();
+
+        virtual asio::awaitable<bool> open() override;
+        virtual asio::awaitable<void> close() override;
+        virtual asio::awaitable<bool> is_open() override;
+        virtual asio::awaitable<bool> send_request(const char *data, uint16_t data_length, handle_response handler) override;
+
+    protected:
+        void create_client();
+        asio::awaitable<bool> connect();
+        void disconnect();
+        bool is_connected();
+
+        void handle_exception(std::error_code error) override;
+
+        asio::any_io_executor executor_;
+        asio::ssl::context *tls_context_;
+        std::shared_ptr<socks::socks_tls_client> client_;
+
+        char buffer_[dns::buffer_size];
+    };
+
     class http_header
     {
     public:
@@ -101,39 +135,21 @@ namespace dns
         int content_length;
     };
 
-    class dns_https_upstream_property
-    {
-        PROPERTY_READWRITE(bool, keep_alive);
-    };
-
-    class dns_https_upstream : public dns_https_upstream_property, public dns_upstream
+    class dns_https_upstream : public dns_tls_upstream
     {
     public:
-        dns_https_upstream(asio::any_io_executor executor, std::string url);
-        ~dns_https_upstream();
+        dns_https_upstream(asio::any_io_executor executor, std::string host, uint16_t port, std::string url);
 
-        asio::awaitable<bool> open() override;
-        asio::awaitable<void> close() override;
-        asio::awaitable<bool> is_open() override;
         asio::awaitable<bool> send_request(const char *data, uint16_t data_length, handle_response handler) override;
 
     protected:
-        asio::awaitable<bool> connect();
-        void disconnect();
-        bool is_connected();
-
         void parse_url(std::string url);
         http_header parse_http_header(const std::string &header_string);
         bool check_http_header(http_header header);
         char *search_substring(char *buffer, std::size_t buffer_length, const char *substring);
-        void handle_exception(std::error_code error) override;
 
     private:
-        asio::ssl::context *tls_context_;
-        std::shared_ptr<socks::socks_tls_client> client_;
-
         std::string scheme_;
         std::string path_;
-        char buffer_[dns::buffer_size];
     };
 }

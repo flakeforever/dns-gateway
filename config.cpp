@@ -115,13 +115,25 @@ namespace config
                                 {
                                     upstream.uri = upstream_obj["uri"].get<std::string>();
                                 }
+                                if (upstream_obj.find("security_verify") != upstream_obj.end() && upstream_obj["security_verify"].is<bool>())
+                                {
+                                    upstream.security_verify = upstream_obj["security_verify"].get<bool>();
+                                }
+                                if (upstream_obj.find("ca_certificate") != upstream_obj.end() && upstream_obj["ca_certificate"].is<std::string>())
+                                {
+                                    upstream.ca_certificate = upstream_obj["ca_certificate"].get<std::string>();
+                                }
+                                if (upstream_obj.find("certificate") != upstream_obj.end() && upstream_obj["certificate"].is<std::string>())
+                                {
+                                    upstream.certificate = upstream_obj["certificate"].get<std::string>();
+                                }
+                                if (upstream_obj.find("private_key") != upstream_obj.end() && upstream_obj["private_key"].is<std::string>())
+                                {
+                                    upstream.private_key = upstream_obj["private_key"].get<std::string>();
+                                }
                                 if (upstream_obj.find("proxy") != upstream_obj.end() && upstream_obj["proxy"].is<std::string>())
                                 {
                                     upstream.proxy = upstream_obj["proxy"].get<std::string>();
-                                }
-                                if (upstream_obj.find("keep_alive") != upstream_obj.end() && upstream_obj["keep_alive"].is<bool>())
-                                {
-                                    upstream.keep_alive = upstream_obj["keep_alive"].get<bool>();
                                 }
                                 if (upstream_obj.find("check_enabled") != upstream_obj.end() && upstream_obj["check_enabled"].is<bool>())
                                 {

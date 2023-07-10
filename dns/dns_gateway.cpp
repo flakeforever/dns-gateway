@@ -184,7 +184,7 @@ namespace dns
 
         {
             await_coroutine_lock lock(executor_, statics_.locked_);
-            co_await lock.check_lock();
+            co_await lock.get_lock();
 
             // check domain static
             static_values =
@@ -264,7 +264,7 @@ namespace dns
         }
 
         await_coroutine_lock lock(executor_, cache_.locked_);
-        co_await lock.check_lock();
+        co_await lock.get_lock();
 
         dns_cache_entry *cache_entry = co_await cache_.get_free_cache();
         if (cache_entry != nullptr)
@@ -289,7 +289,7 @@ namespace dns
 
         {
             await_coroutine_lock lock(executor_, cache_.locked_);
-            co_await lock.check_lock();
+            co_await lock.get_lock();
 
             dns_cache_entry *cache_entry =
                 co_await cache_.query_cache(dns_object->question_domain_, dns_object->question_type_);
@@ -454,7 +454,7 @@ namespace dns
                 try
                 {
                     await_coroutine_lock lock(executor_, dns_upstream->locked_);
-                    co_await lock.check_lock();
+                    co_await lock.get_lock();
 
                     bool status = co_await dns_upstream->is_open();
                     if (!status)
@@ -509,7 +509,7 @@ namespace dns
                 try
                 {
                     await_coroutine_lock lock(executor_, dns_upstream->locked_);
-                    co_await lock.check_lock();
+                    co_await lock.get_lock();
 
                     co_await dns_upstream->close();
                 }
@@ -602,7 +602,7 @@ namespace dns
                                         try
                                         {
                                             await_coroutine_lock lock(executor_, dns_upstream->locked_);
-                                            co_await lock.check_lock();
+                                            co_await lock.get_lock();
 
                                             bool status = co_await dns_upstream->is_open();
                                             if (!status)

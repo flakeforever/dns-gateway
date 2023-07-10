@@ -211,7 +211,7 @@ namespace dns
                 {
                     current_pos = position_;
                 }
-                
+
                 position_ = offset;
             }
             else
@@ -253,5 +253,10 @@ namespace dns
         std::string str(buffer);
         delete[] buffer;
         return str;
+    }
+
+    char *dns_buffer::data() const
+    {
+        return (char *)&buffer_[0];
     }
 }

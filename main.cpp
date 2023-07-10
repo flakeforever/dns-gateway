@@ -118,8 +118,6 @@ void print_config(const config::dns_config &config)
         {
             std::cout << "    uri: " << upstream.uri << std::endl;
             std::cout << "    proxy: " << upstream.proxy << std::endl;
-            std::string keep_alive = upstream.keep_alive ? "true" : "false";
-            std::cout << "    keep_alive: " << keep_alive << std::endl;
             std::string check_enabled = upstream.check_enabled ? "true" : "false";
             std::cout << "    check_enabled: " << check_enabled << std::endl;
             std::cout << "    check_interval: " << upstream.check_interval << std::endl;
@@ -293,10 +291,52 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway, config::dns_config
                 upstream_group->add_upstream(udp_upstream);
                 gateway->upstreams_.push_back(udp_upstream);
             }
+            else if (uri.scheme() == "dot")
+            {
+                uint16_t port = 853;
+
+                if (uri.port() != "")
+                {
+                    port = std::stoi(uri.port());
+                }
+
+                std::shared_ptr<dns::dns_tls_upstream> tls_upstream =
+                    std::make_shared<dns::dns_tls_upstream>(gateway->get_executor(), uri.host(), port);
+
+                if (upstream.proxy != "")
+                {
+                    Url proxy_uri(upstream.proxy);
+                    if (proxy_uri.scheme() == "socks5")
+                    {
+                        uint16_t proxy_port = std::stoi(proxy_uri.port());
+                        tls_upstream->set_proxy(socks::proxy_type::socks5, proxy_uri.host(), proxy_port);
+                    }
+                }
+
+                // tls_upstream->keep_alive(upstream.keep_alive);
+                tls_upstream->security_verify(upstream.security_verify);
+                tls_upstream->ca_certificate(upstream.ca_certificate);
+                tls_upstream->certificate(upstream.certificate);
+                tls_upstream->private_key(upstream.private_key);
+
+                tls_upstream->check_enabled(upstream.check_enabled);
+                tls_upstream->check_interval(upstream.check_interval);
+
+                upstream_group->add_upstream(tls_upstream);
+                gateway->upstreams_.push_back(tls_upstream);
+            }
             else if (uri.scheme() == "doh")
             {
+                uint16_t port = 443;
+
+                if (uri.port() != "")
+                {
+                    port = std::stoi(uri.port());
+                }
+
                 std::shared_ptr<dns::dns_https_upstream> https_upstream =
-                    std::make_shared<dns::dns_https_upstream>(gateway->get_executor(), upstream.uri);
+                    std::make_shared<dns::dns_https_upstream>(
+                        gateway->get_executor(), uri.host(), port, upstream.uri);
 
                 if (upstream.proxy != "")
                 {
@@ -308,7 +348,11 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway, config::dns_config
                     }
                 }
 
-                https_upstream->keep_alive(upstream.keep_alive);
+                https_upstream->security_verify(upstream.security_verify);
+                https_upstream->ca_certificate(upstream.ca_certificate);
+                https_upstream->certificate(upstream.certificate);
+                https_upstream->private_key(upstream.private_key);
+
                 https_upstream->check_enabled(upstream.check_enabled);
                 https_upstream->check_interval(upstream.check_interval);
 

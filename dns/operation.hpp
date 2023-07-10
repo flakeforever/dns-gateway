@@ -46,28 +46,13 @@ private:
     asio::steady_timer timer_;
 };
 
-class await_lock
-{
-public:
-    await_lock(asio::any_io_executor executor, std::mutex& mutex);
-
-    asio::awaitable<void> check_lock();
-
-    std::unique_lock<std::mutex> lock_;
-
-private:
-    asio::awaitable<void> wait(std::chrono::milliseconds duration);
-
-    asio::steady_timer timer_;
-};
-
 class await_coroutine_lock
 {
 public:
     await_coroutine_lock(asio::any_io_executor executor, std::atomic_bool &locked);
     ~await_coroutine_lock();
 
-    asio::awaitable<void> check_lock();
+    asio::awaitable<void>get_lock();
 private:
     
     asio::awaitable<void> wait(std::chrono::milliseconds duration);

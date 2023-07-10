@@ -29,7 +29,7 @@ namespace dns
     asio::awaitable<std::shared_ptr<dns_upstream>> dns_upstream_group::get_next_upstream()
     {
         await_coroutine_lock lock(executor_, locked_);
-        co_await lock.check_lock();
+        co_await lock.get_lock();
 
         // Get the next upstream in a round-robin fashion
         size_t size = upstreams_.size();
@@ -86,7 +86,7 @@ namespace dns
     asio::awaitable<uint8_t> dns_router::get_route(const std::string &domain)
     {
         await_coroutine_lock lock(executor_, locked_);
-        co_await lock.check_lock();
+        co_await lock.get_lock();
 
         co_return search_in_trie(root_, domain);
     }

@@ -403,8 +403,6 @@ namespace socks
 
     asio::awaitable<bool> socks_tls_client::connect(const std::string &host, uint16_t port)
     {
-        tls_socket_.set_verify_mode(asio::ssl::verify_peer);
-
         bool status = co_await ::socks::socks_base_client::connect(
             (asio::ip::tcp::socket &)tls_socket_.lowest_layer(), host, port);
 

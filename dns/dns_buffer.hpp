@@ -52,7 +52,8 @@ namespace dns
         void read_buffer(char *buffer, size_t length);
         std::string read_domain();
         std::string read_text();
-
+        
+        char *data() const;
     private:
         void assert_buffer(size_t operation_size);
         uint16_t get_label_ptr(const std::string label);

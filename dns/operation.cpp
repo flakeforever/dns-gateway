@@ -47,28 +47,6 @@ asio::awaitable<void> await_wait::wait(std::chrono::milliseconds duration)
     co_await timer_.async_wait(asio::use_awaitable);
 }
 
-await_lock::await_lock(asio::any_io_executor executor, std::mutex &mutex)
-    : lock_(mutex), timer_(executor)
-{
-}
-
-asio::awaitable<void> await_lock::check_lock()
-{
-    while (!lock_.owns_lock())
-    {
-        co_await wait(std::chrono::milliseconds(check_interval));
-        lock_.try_lock();
-    }
-
-    co_return;
-}
-
-asio::awaitable<void> await_lock::wait(std::chrono::milliseconds duration)
-{
-    timer_.expires_after(duration);
-    co_await timer_.async_wait(asio::use_awaitable);
-}
-
 await_coroutine_lock::await_coroutine_lock(asio::any_io_executor executor, std::atomic_bool &locked)
     : locked_(locked), timer_(executor)
 {
@@ -83,7 +61,7 @@ await_coroutine_lock::~await_coroutine_lock()
     }
 }
 
-asio::awaitable<void> await_coroutine_lock::check_lock()
+asio::awaitable<void> await_coroutine_lock::get_lock()
 {
     while (true)
     {

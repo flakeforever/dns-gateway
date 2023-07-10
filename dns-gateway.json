@@ -24,15 +24,28 @@
       "upstreams": [
         {
           "uri": "doh://1.1.1.1/dns-query",
+          "security_verify": true,
           "proxy": "socks5://192.168.88.1:1080",
-          "keep_alive": true,
+          "check_enabled": true,
+          "check_interval": 90
+        },
+        {
+          "uri": "dot://1.1.1.1",
+          "proxy": "socks5://192.168.88.1:1080",
           "check_enabled": true,
           "check_interval": 90
         },
         {
           "uri": "doh://8.8.8.8/dns-query",
+          "security_verify": true,
           "proxy": "socks5://192.168.88.1:1080",
-          "keep_alive": true,
+          "check_enabled": true,
+          "check_interval": 90
+        },
+        {
+          "uri": "dot://8.8.8.8",
+          "security_verify": true,
+          "proxy": "socks5://192.168.88.1:1080",
           "check_enabled": true,
           "check_interval": 90
         }

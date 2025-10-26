@@ -1,0 +1,92 @@
+{
+  "max_works": 1,
+  "min_pools": 5,
+  "max_pools": 50,
+  "max_cache": 100,
+  "protocol": "ipv4",
+  "listen_address": "",
+  "listen_port": 53,
+  "monitor_port": 8001,
+  "log_level": "info",
+  "groups": [
+    {
+      "name": "local-service",
+      "pools": 5,
+      "upstreams": [
+        {
+          "uri": "udp://1.1.1.1"
+        },
+        {
+          "uri": "udp://8.8.8.8"
+        }
+      ]
+    },
+    {
+      "name": "security",
+      "default": true,
+      "pools": 5,
+      "upstreams": [
+        {
+          "uri": "doh://cloudflare-dns.com/dns-query",
+          "keep_alive": true,
+          "security_verify": true,
+            "proxy": "socks5://192.168.1.1:1080",
+            "check_enabled": true,
+            "check_interval": 45,
+            "check_domains": "one.one.one.one"
+        },
+        {
+          "uri": "dot://8.8.8.8",
+          "keep_alive": true,
+          "security_verify": true,
+          "proxy": "socks5://192.168.88.1:1080",
+          "check_enabled": true,
+          "check_interval": 90,
+          "check_domains": "dns.google"
+        },
+        {
+          "uri": "dot://example:853",
+          "security_verify": true,
+          "ca_certificate": "/etc/dns-gateway/cert/ca.cert",
+          "certificate": "/etc/dns-gateway/cert/example.pem",
+          "private_key": "/etc/dns-gateway/cert/key.pem",
+          "proxy": "socks5://192.168.88.1:1080",
+          "check_enabled": true,
+          "check_interval": 90
+        }
+      ]
+    }
+  ],
+  "routes": [
+    {
+      "rules": [
+        {
+          "file": "non-security-list.txt",
+          "group": "local-service"
+        }
+      ],
+      "statics": [
+        {
+          "domain": "api.example.com",
+          "type": "A",
+          "value": "192.168.0.1"
+        },
+        {
+          "domain": "api.example.com",
+          "type": "AAAA",
+          "value": "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+        },
+        {
+          "domain": "example.com",
+          "type": "TXT",
+          "value": "This is a test result for DNS static routing."
+        },
+        {
+          "domain": "example.com",
+          "type": "TXT",
+          "value": "This is a multi-entry test for the same type."
+        }
+      ]
+    }
+  ]
+}

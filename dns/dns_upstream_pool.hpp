@@ -130,9 +130,38 @@ public:
   asio::awaitable<void> clear();
 
 private:
+  // Balance load sub-methods for better readability
+  asio::awaitable<void> scale_down(
+    std::vector<std::shared_ptr<dns_pool_connections>> &active_connections,
+    size_t current_instance_count);
+  
+  asio::awaitable<void> rebalance_distribution(
+    std::vector<std::shared_ptr<dns_pool_connections>> &active_connections);
+  
+  asio::awaitable<void> scale_up(
+    std::vector<std::shared_ptr<dns_pool_connections>> &active_connections,
+    size_t current_instance_count);
+  
+  // Health check sub-methods for better readability
+  asio::awaitable<void> check_active_connections(
+    std::shared_ptr<dns_pool_connections> connections,
+    std::chrono::steady_clock::time_point now);
+  
+  asio::awaitable<void> recover_degraded_connections(
+    std::shared_ptr<dns_pool_connections> connections,
+    std::chrono::steady_clock::time_point now);
+  
+  asio::awaitable<void> recover_offline_connections(
+    std::shared_ptr<dns_pool_connections> connections,
+    std::chrono::steady_clock::time_point now);
+  
+  // Reset cumulative counters for fair competition when instance count changes
+  void reset_all_cumulative_counters();
+
   asio::any_io_executor executor_;
   std::vector<std::shared_ptr<dns_pool_connections>> connections_list_;
   size_t current_index_;
+  size_t last_total_instance_count_{0};  // Track instance count for change detection
   mutable std::mutex mutex_;
   char check_buffer_[dns::buffer_size];
 };

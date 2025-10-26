@@ -287,6 +287,17 @@ asio::awaitable<void> dns_pool_group::init() {
   // Balance load after initialization
   co_await balance_load();
 
+  // Initialize last_total_instance_count after init
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    last_total_instance_count_ = 0;
+    for (const auto &connections : connections_list_) {
+      if (connections->status_ == connection_status::active) {
+        last_total_instance_count_ += connections->get_instance_count();
+      }
+    }
+  }
+
   common::log.debug("group '%s' initialization completed", name().c_str());
 }
 
@@ -322,175 +333,200 @@ asio::awaitable<void> dns_pool_group::balance_load() {
                     name().c_str(), target_size_, current_instance_count, 
                     active_connections.size());
 
-  // Check if we need to scale down (too many instances)
+  // Dispatch to appropriate sub-method based on current state
   if (current_instance_count > target_size_) {
-    size_t instances_to_remove = current_instance_count - target_size_;
-    common::log.debug("group '%s' has too many instances, need to remove %zu",
-                      name().c_str(), instances_to_remove);
+    // Too many instances - scale down
+    co_await scale_down(active_connections, current_instance_count);
+  } else if (current_instance_count == target_size_) {
+    // Target reached - check if rebalancing is needed
+    co_await rebalance_distribution(active_connections);
+  } else {
+    // Not enough instances - scale up
+    co_await scale_up(active_connections, current_instance_count);
+  }
+  
+  common::log.debug("group '%s' load balancing completed", name().c_str());
+}
+
+// Scale down: remove excess instances to reach target
+asio::awaitable<void> dns_pool_group::scale_down(
+    std::vector<std::shared_ptr<dns_pool_connections>> &active_connections,
+    size_t current_instance_count) {
+  
+  size_t instances_to_remove = current_instance_count - target_size_;
+  common::log.debug("group '%s' has too many instances, need to remove %zu",
+                    name().c_str(), instances_to_remove);
+  
+  // Sort connections by instance count (descending)
+  std::sort(active_connections.begin(), active_connections.end(),
+            [](const auto &a, const auto &b) {
+              return a->get_instance_count() > b->get_instance_count();
+            });
+  
+  // Remove instances from connections with the most instances first
+  for (auto &connections : active_connections) {
+    if (instances_to_remove == 0) break;
     
-    // Sort connections by instance count (descending)
-    std::sort(active_connections.begin(), active_connections.end(),
-              [](const auto &a, const auto &b) {
-                return a->get_instance_count() > b->get_instance_count();
-              });
+    size_t current_count = connections->get_instance_count();
+    if (current_count <= 1) continue;  // Keep at least 1 instance per connection
     
-    // Remove instances from connections with the most instances first
-    for (auto &connections : active_connections) {
-      if (instances_to_remove == 0) break;
-      
-      size_t current_count = connections->get_instance_count();
-      if (current_count <= 1) continue;  // Keep at least 1 instance per connection
-      
-      // Calculate how many to remove from this connections (at most half, rounded down)
-      size_t can_remove = std::min(instances_to_remove, (current_count - 1) / 2 + (current_count - 1) % 2);
-      
-      if (can_remove > 0) {
-        std::vector<std::shared_ptr<dns_upstream>> instances_to_close;
-        {
-          std::lock_guard<std::mutex> lock(connections->mutex_);
-          // Remove from the end (LIFO)
-          for (size_t i = 0; i < can_remove && !connections->instances_.empty(); ++i) {
-            auto instance = connections->instances_.back();
-            connections->instances_.pop_back();
-            connections->last_check_times_.erase(instance);
-            instances_to_close.push_back(instance);
-          }
+    // Calculate how many to remove from this connections (at most half, rounded down)
+    size_t can_remove = std::min(instances_to_remove, (current_count - 1) / 2 + (current_count - 1) % 2);
+    
+    if (can_remove > 0) {
+      std::vector<std::shared_ptr<dns_upstream>> instances_to_close;
+      {
+        std::lock_guard<std::mutex> lock(connections->mutex_);
+        // Remove from the end (LIFO)
+        for (size_t i = 0; i < can_remove && !connections->instances_.empty(); ++i) {
+          auto instance = connections->instances_.back();
+          connections->instances_.pop_back();
+          connections->last_check_times_.erase(instance);
+          instances_to_close.push_back(instance);
         }
-        
-        // Close instances outside the lock
-        for (auto &instance : instances_to_close) {
-          co_await instance->close();
-        }
-        
-        common::log.debug("removed %zu instances from connections %s (had %zu)",
-                          instances_to_close.size(), connections->data_.uri.c_str(), current_count);
-        
-        instances_to_remove -= instances_to_close.size();
       }
+      
+      // Close instances outside the lock
+      for (auto &instance : instances_to_close) {
+        co_await instance->close();
+      }
+      
+      common::log.debug("removed %zu instances from connections %s (had %zu)",
+                        instances_to_close.size(), connections->data_.uri.c_str(), current_count);
+      
+      instances_to_remove -= instances_to_close.size();
     }
+  }
+  
+  common::log.debug("group '%s' scale-down completed", name().c_str());
+}
+
+// Rebalance distribution: redistribute instances evenly across connections
+asio::awaitable<void> dns_pool_group::rebalance_distribution(
+    std::vector<std::shared_ptr<dns_pool_connections>> &active_connections) {
+  
+  // Check if distribution is balanced
+  size_t ideal_per_connection = target_size_ / active_connections.size();
+  size_t remainder = target_size_ % active_connections.size();
+  
+  // Determine tolerance based on scale: stricter for smaller pools
+  // For small pools (< 20 instances), require exact distribution
+  // For larger pools, allow ±1 variance
+  size_t tolerance = (target_size_ >= 20) ? 1 : 0;
+  
+  bool needs_rebalance = false;
+  for (size_t i = 0; i < active_connections.size(); ++i) {
+    size_t expected = ideal_per_connection + (i < remainder ? 1 : 0);
+    size_t actual = active_connections[i]->get_instance_count();
     
-    common::log.debug("group '%s' scale-down completed", name().c_str());
+    // Check if actual deviates from expected by more than tolerance
+    if (actual > expected + tolerance || (actual + tolerance < expected && expected > 0)) {
+      needs_rebalance = true;
+      break;
+    }
+  }
+  
+  if (!needs_rebalance) {
+    common::log.debug("group '%s' already has target instances (%zu) with balanced distribution",
+                      name().c_str(), target_size_);
     co_return;
   }
   
-  // Check if we already have target instances, but also check distribution
-  if (current_instance_count == target_size_) {
-    // Check if distribution is balanced
-    size_t ideal_per_connection = target_size_ / active_connections.size();
-    size_t remainder = target_size_ % active_connections.size();
+  common::log.debug("group '%s' has target instances (%zu) but distribution is unbalanced, rebalancing",
+                    name().c_str(), target_size_);
+  
+  // Rebalance strategy: First ADD to under-provisioned, then REMOVE from over-provisioned
+  // This ensures capacity is always >= target during rebalancing
+  
+  // Step 1: Add instances to under-provisioned connections first
+  for (size_t i = 0; i < active_connections.size(); ++i) {
+    auto &connections = active_connections[i];
+    size_t current_count = connections->get_instance_count();
+    size_t expected = ideal_per_connection + (i < remainder ? 1 : 0);
     
-    // Determine tolerance based on scale: stricter for smaller pools
-    // For small pools (< 20 instances), require exact distribution
-    // For larger pools, allow ±1 variance
-    size_t tolerance = (target_size_ >= 20) ? 1 : 0;
-    
-    bool needs_rebalance = false;
-    for (size_t i = 0; i < active_connections.size(); ++i) {
-      size_t expected = ideal_per_connection + (i < remainder ? 1 : 0);
-      size_t actual = active_connections[i]->get_instance_count();
+    // Use the same tolerance for consistency
+    if (current_count + tolerance < expected && expected > 0) {
+      // This connections needs more
+      size_t to_add = expected - current_count;
+      size_t added = 0;
       
-      // Check if actual deviates from expected by more than tolerance
-      if (actual > expected + tolerance || (actual + tolerance < expected && expected > 0)) {
-        needs_rebalance = true;
-        break;
-      }
-    }
-    
-    if (!needs_rebalance) {
-      common::log.debug("group '%s' already has target instances (%zu) with balanced distribution",
-                        name().c_str(), target_size_);
-      co_return;
-    }
-    
-    common::log.debug("group '%s' has target instances (%zu) but distribution is unbalanced, rebalancing",
-                      name().c_str(), target_size_);
-    
-    // Rebalance strategy: First ADD to under-provisioned, then REMOVE from over-provisioned
-    // This ensures capacity is always >= target during rebalancing
-    
-    // Step 1: Add instances to under-provisioned connections first
-    for (size_t i = 0; i < active_connections.size(); ++i) {
-      auto &connections = active_connections[i];
-      size_t current_count = connections->get_instance_count();
-      size_t expected = ideal_per_connection + (i < remainder ? 1 : 0);
-      
-      // Use the same tolerance for consistency
-      if (current_count + tolerance < expected && expected > 0) {
-        // This connections needs more
-        size_t to_add = expected - current_count;
-        size_t added = 0;
+      for (size_t j = 0; j < to_add; ++j) {
+        auto instance = connections->create_single_instance();
+        if (!instance) continue;
         
-        for (size_t j = 0; j < to_add; ++j) {
-          auto instance = connections->create_single_instance();
-          if (!instance) continue;
-          
-          bool open_success = false;
-          try {
-            open_success = co_await instance->open();
-          } catch (const std::exception &e) {
-            common::log.debug("exception when opening rebalance upstream: %s", e.what());
-          }
-          
-          if (open_success) {
-            std::lock_guard<std::mutex> lock(connections->mutex_);
-            connections->instances_.push_back(instance);
-            connections->last_check_times_[instance] = std::chrono::steady_clock::now();
-            added++;
-          }
+        bool open_success = false;
+        try {
+          open_success = co_await instance->open();
+        } catch (const std::exception &e) {
+          common::log.debug("exception when opening rebalance upstream: %s", e.what());
         }
         
-        if (added > 0) {
-          common::log.debug("rebalance: added %zu instances to connections %s (had %zu, expected %zu)",
-                            added, connections->data_.uri.c_str(), current_count, expected);
-        }
-      }
-    }
-    
-    // Step 2: Now remove excess instances from over-provisioned connections
-    // Sort by instance count descending to prioritize removing from the most over-provisioned
-    std::sort(active_connections.begin(), active_connections.end(),
-              [](const auto &a, const auto &b) {
-                return a->get_instance_count() > b->get_instance_count();
-              });
-    
-    for (size_t i = 0; i < active_connections.size(); ++i) {
-      auto &connections = active_connections[i];
-      size_t current_count = connections->get_instance_count();
-      size_t expected = ideal_per_connection + (i < remainder ? 1 : 0);
-      
-      // Use the same tolerance for consistency
-      if (current_count > expected + tolerance) {
-        // This connections has too many, remove excess
-        size_t to_remove = current_count - expected;
-        
-        std::vector<std::shared_ptr<dns_upstream>> instances_to_close;
-        {
+        if (open_success) {
           std::lock_guard<std::mutex> lock(connections->mutex_);
-          // Remove from the end (LIFO - keep older, more stable connections)
-          for (size_t j = 0; j < to_remove && !connections->instances_.empty(); ++j) {
-            auto instance = connections->instances_.back();
-            connections->instances_.pop_back();
-            connections->last_check_times_.erase(instance);
-            instances_to_close.push_back(instance);
-          }
+          connections->instances_.push_back(instance);
+          connections->last_check_times_[instance] = std::chrono::steady_clock::now();
+          added++;
         }
-        
-        // Close instances outside the lock
-        for (auto &instance : instances_to_close) {
-          co_await instance->close();
-        }
-        
-        common::log.debug("rebalance: removed %zu instances from connections %s (had %zu, expected %zu)",
-                          instances_to_close.size(), connections->data_.uri.c_str(), 
-                          current_count, expected);
+      }
+      
+      if (added > 0) {
+        common::log.debug("rebalance: added %zu instances to connections %s (had %zu, expected %zu)",
+                          added, connections->data_.uri.c_str(), current_count, expected);
+        // Reset cumulative counters for fair competition after adding instances
+        reset_all_cumulative_counters();
       }
     }
-    
-    common::log.debug("group '%s' rebalancing completed", name().c_str());
-    co_return;
   }
+  
+  // Step 2: Now remove excess instances from over-provisioned connections
+  // Sort by instance count descending to prioritize removing from the most over-provisioned
+  std::sort(active_connections.begin(), active_connections.end(),
+            [](const auto &a, const auto &b) {
+              return a->get_instance_count() > b->get_instance_count();
+            });
+  
+  for (size_t i = 0; i < active_connections.size(); ++i) {
+    auto &connections = active_connections[i];
+    size_t current_count = connections->get_instance_count();
+    size_t expected = ideal_per_connection + (i < remainder ? 1 : 0);
+    
+    // Use the same tolerance for consistency
+    if (current_count > expected + tolerance) {
+      // This connections has too many, remove excess
+      size_t to_remove = current_count - expected;
+      
+      std::vector<std::shared_ptr<dns_upstream>> instances_to_close;
+      {
+        std::lock_guard<std::mutex> lock(connections->mutex_);
+        // Remove from the end (LIFO - keep older, more stable connections)
+        for (size_t j = 0; j < to_remove && !connections->instances_.empty(); ++j) {
+          auto instance = connections->instances_.back();
+          connections->instances_.pop_back();
+          connections->last_check_times_.erase(instance);
+          instances_to_close.push_back(instance);
+        }
+      }
+      
+      // Close instances outside the lock
+      for (auto &instance : instances_to_close) {
+        co_await instance->close();
+      }
+      
+      common::log.debug("rebalance: removed %zu instances from connections %s (had %zu, expected %zu)",
+                        instances_to_close.size(), connections->data_.uri.c_str(), 
+                        current_count, expected);
+    }
+  }
+  
+  common::log.debug("group '%s' rebalancing completed", name().c_str());
+}
 
-  // Scale up: calculate how many more instances we need
+// Scale up: create new instances to reach target
+asio::awaitable<void> dns_pool_group::scale_up(
+    std::vector<std::shared_ptr<dns_pool_connections>> &active_connections,
+    size_t current_instance_count) {
+  
+  // Calculate how many more instances we need
   size_t instances_needed = target_size_ - current_instance_count;
   common::log.debug("group '%s' needs %zu more instances",
                     name().c_str(), instances_needed);
@@ -563,7 +599,42 @@ asio::awaitable<void> dns_pool_group::balance_load() {
                       instances_to_create, failed_count);
   }
 
-  common::log.debug("group '%s' load balancing completed", name().c_str());
+  common::log.debug("group '%s' scale-up completed", name().c_str());
+  
+  // Reset cumulative counters for fair competition after scaling up
+  reset_all_cumulative_counters();
+}
+
+// Reset cumulative counters for all instances in this group for fair competition
+void dns_pool_group::reset_all_cumulative_counters() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  
+  // Count current total instances
+  size_t current_total = 0;
+  for (const auto &connections : connections_list_) {
+    if (connections->status_ == connection_status::active) {
+      current_total += connections->get_instance_count();
+    }
+  }
+  
+  // If instance count changed, reset all cumulative counters for fair competition
+  if (current_total != last_total_instance_count_) {
+    size_t reset_count = 0;
+    for (const auto &connections : connections_list_) {
+      if (connections->status_ == connection_status::active) {
+        auto instances = connections->get_all_instances();
+        for (auto &instance : instances) {
+          instance->cumulative_requests_.store(0, std::memory_order_relaxed);
+          reset_count++;
+        }
+      }
+    }
+    
+    common::log.info("group '%s': instance count changed from %zu to %zu, reset %zu cumulative counters for fair competition",
+                     name().c_str(), last_total_instance_count_, current_total, reset_count);
+    
+    last_total_instance_count_ = current_total;
+  }
 }
 
 std::shared_ptr<dns_pool_connections>
@@ -787,222 +858,16 @@ asio::awaitable<void> dns_pool_group::handle_check() {
         connections_list = connections_list_;
       }
       
-      // Process all connections in this group
+      // Process all connections in this group based on their status
       for (auto &connections : connections_list) {
         auto current_status = connections->status_;
         
-        // 1. Check active connections
         if (current_status == connection_status::active) {
-          std::vector<std::shared_ptr<dns_upstream>> instances_to_check;
-          {
-            std::lock_guard<std::mutex> lock(connections->mutex_);
-            instances_to_check = connections->instances_;
-          }
-          
-          // First, aggregate statistics from ALL instances (before checking health)
-          uint64_t total_req = 0, total_succ = 0, total_fail = 0;
-          int64_t total_resp_time = 0;
-          
-          for (auto &instance : instances_to_check) {
-            // Read and reset statistics atomically
-            uint64_t req = instance->request_count_.exchange(0, std::memory_order_relaxed);
-            uint64_t succ = instance->success_count_.exchange(0, std::memory_order_relaxed);
-            uint64_t fail = instance->failed_count_.exchange(0, std::memory_order_relaxed);
-            int64_t resp_time = instance->total_response_time_ms_.exchange(0, std::memory_order_relaxed);
-            
-            total_req += req;
-            total_succ += succ;
-            total_fail += fail;
-            total_resp_time += resp_time;
-          }
-          
-          // Aggregate to connections statistics
-          if (total_req > 0) {
-            connections->statistics_.total_requests.fetch_add(total_req, std::memory_order_relaxed);
-            connections->statistics_.success_requests.fetch_add(total_succ, std::memory_order_relaxed);
-            connections->statistics_.failed_requests.fetch_add(total_fail, std::memory_order_relaxed);
-            connections->statistics_.total_response_time_ms.fetch_add(total_resp_time, std::memory_order_relaxed);
-            
-            common::log.debug("aggregated stats for connections %s: req=%llu, succ=%llu, fail=%llu, avg_time=%lldms",
-                              connections->data_.uri.c_str(),
-                              (unsigned long long)total_req, (unsigned long long)total_succ, (unsigned long long)total_fail,
-                              total_req > 0 ? (long long)(total_resp_time / total_req) : 0LL);
-          }
-          
-          // Then, remove closed upstreams and perform health checks
-          size_t removed_count = 0;
-          for (auto it = instances_to_check.begin(); it != instances_to_check.end();) {
-            auto instance = *it;
-            
-            // Check if upstream is open
-            bool is_open = co_await instance->is_open();
-            if (!is_open) {
-              // Remove closed instance
-              std::lock_guard<std::mutex> lock(connections->mutex_);
-              auto inst_it = std::find(connections->instances_.begin(), 
-                                       connections->instances_.end(), instance);
-              if (inst_it != connections->instances_.end()) {
-                connections->instances_.erase(inst_it);
-                connections->last_check_times_.erase(instance);
-                removed_count++;
-              }
-              it = instances_to_check.erase(it);
-              continue;
-            }
-            
-            // Perform health check if enabled
-            if (instance->check_enabled()) {
-              auto time_since_check = std::chrono::duration_cast<std::chrono::seconds>(
-                  now - connections->last_check_times_[instance]).count();
-              
-              // Check if it's time for a health check
-              if (connections->last_check_times_.find(instance) == connections->last_check_times_.end() ||
-                  time_since_check >= instance->check_interval()) {
-                
-                // Update last check time
-                connections->last_check_times_[instance] = now;
-                
-                // Perform health check using upstream->check() method
-                try {
-                  bool check_passed = co_await instance->check();
-                  
-                  if (!check_passed) {
-                    // Health check failed
-                    // The connection should already be closed by check() on failure
-                    // It will be removed in the next check cycle
-                    common::log.warning("group '%s': health check failed for %s",
-                                        name().c_str(), connections->data_.uri.c_str());
-                  }
-                  
-                } catch (const std::exception &e) {
-                  // Health check error
-                  common::log.warning("group '%s': health check error for %s: %s",
-                                      name().c_str(), connections->data_.uri.c_str(), e.what());
-                }
-              }
-            }
-            
-            ++it;
-          }
-          
-          if (removed_count > 0) {
-            common::log.debug("group '%s': removed %zu closed/failed instances from connections %s",
-                              name().c_str(), removed_count, connections->data_.uri.c_str());
-          }
-          
-          // If all upstreams removed, switch to degraded
-          if (connections->get_instance_count() == 0) {
-            connections->status_ = connection_status::degraded;
-            connections->status_change_time_ = now;
-            connections->attempt_count_ = 0;
-            common::log.warning("group '%s': connections %s switched to degraded (all instances closed/failed)",
-                                name().c_str(), connections->data_.uri.c_str());
-          }
-        }
-        
-        // 2. Check degraded connections
-        else if (current_status == connection_status::degraded) {
-          auto time_since_change = std::chrono::duration_cast<std::chrono::seconds>(
-              now - connections->status_change_time_).count();
-          auto time_since_attempt = std::chrono::duration_cast<std::chrono::seconds>(
-              now - connections->last_attempt_time_).count();
-          
-          // Try every 15 seconds after status change
-          if (time_since_change >= 15 && time_since_attempt >= 15) {
-            connections->last_attempt_time_ = now;
-            connections->attempt_count_++;
-            
-            common::log.debug("group '%s': attempting to recover degraded connections %s (attempt %zu/5)",
-                              name().c_str(), connections->data_.uri.c_str(), 
-                              connections->attempt_count_);
-            
-            auto instance = connections->create_single_instance();
-            if (instance) {
-              bool open_success = false;
-              try {
-                open_success = co_await instance->open();
-              } catch (const std::exception &e) {
-                common::log.debug("group '%s': exception when opening degraded upstream %s: %s",
-                                  name().c_str(), connections->data_.uri.c_str(), e.what());
-              }
-              
-              if (open_success) {
-                // Successfully opened (validated in upstream->open for TLS/HTTPS)
-                {
-                  std::lock_guard<std::mutex> lock(connections->mutex_);
-                  connections->instances_.push_back(instance);
-                  // Initialize last_check_time
-                  connections->last_check_times_[instance] = now;
-                }
-                connections->status_ = connection_status::active;
-                connections->status_change_time_ = now;
-                connections->attempt_count_ = 0;
-                common::log.info("group '%s': connections %s recovered to active",
-                                 name().c_str(), connections->data_.uri.c_str());
-              } else {
-                // Check if reached max attempts
-                if (connections->attempt_count_ >= 5) {
-                  connections->status_ = connection_status::offline;
-                  connections->status_change_time_ = now;
-                  connections->attempt_count_ = 0;
-                  common::log.warning("group '%s': connections %s switched to offline (5 failed attempts)",
-                                      name().c_str(), connections->data_.uri.c_str());
-                }
-              }
-            } else {
-              if (connections->attempt_count_ >= 5) {
-                connections->status_ = connection_status::offline;
-                connections->status_change_time_ = now;
-                connections->attempt_count_ = 0;
-                common::log.warning("group '%s': connections %s switched to offline (5 failed attempts)",
-                                    name().c_str(), connections->data_.uri.c_str());
-              }
-            }
-          }
-        }
-        
-        // 3. Check offline connections
-        else if (current_status == connection_status::offline) {
-          auto time_since_change = std::chrono::duration_cast<std::chrono::seconds>(
-              now - connections->status_change_time_).count();
-          auto time_since_attempt = std::chrono::duration_cast<std::chrono::seconds>(
-              now - connections->last_attempt_time_).count();
-          
-          // Try every 120 seconds after status change
-          if (time_since_change >= 120 && time_since_attempt >= 120) {
-            connections->last_attempt_time_ = now;
-            connections->attempt_count_++;
-            
-            common::log.debug("group '%s': attempting to recover offline connections %s (attempt %zu)",
-                              name().c_str(), connections->data_.uri.c_str(), 
-                              connections->attempt_count_);
-            
-            auto instance = connections->create_single_instance();
-            if (instance) {
-              bool open_success = false;
-              try {
-                open_success = co_await instance->open();
-              } catch (const std::exception &e) {
-                common::log.debug("group '%s': exception when opening offline upstream %s: %s",
-                                  name().c_str(), connections->data_.uri.c_str(), e.what());
-              }
-              
-              if (open_success) {
-                // Successfully opened (validated in upstream->open for TLS/HTTPS)
-                {
-                  std::lock_guard<std::mutex> lock(connections->mutex_);
-                  connections->instances_.push_back(instance);
-                  // Initialize last_check_time
-                  connections->last_check_times_[instance] = now;
-                }
-                connections->status_ = connection_status::active;
-                connections->status_change_time_ = now;
-                connections->attempt_count_ = 0;
-                common::log.info("group '%s': connections %s recovered from offline to active",
-                                 name().c_str(), connections->data_.uri.c_str());
-              }
-            }
-          }
+          co_await check_active_connections(connections, now);
+        } else if (current_status == connection_status::degraded) {
+          co_await recover_degraded_connections(connections, now);
+        } else if (current_status == connection_status::offline) {
+          co_await recover_offline_connections(connections, now);
         }
       }
       
@@ -1024,6 +889,235 @@ asio::awaitable<void> dns_pool_group::handle_check() {
   }
   
   co_return;
+}
+
+// Check active connections: aggregate statistics, remove closed instances, perform health checks
+asio::awaitable<void> dns_pool_group::check_active_connections(
+    std::shared_ptr<dns_pool_connections> connections,
+    std::chrono::steady_clock::time_point now) {
+  
+  std::vector<std::shared_ptr<dns_upstream>> instances_to_check;
+  {
+    std::lock_guard<std::mutex> lock(connections->mutex_);
+    instances_to_check = connections->instances_;
+  }
+  
+  // First, aggregate statistics from ALL instances (before checking health)
+  uint64_t total_req = 0, total_succ = 0, total_fail = 0;
+  int64_t total_resp_time = 0;
+  
+  for (auto &instance : instances_to_check) {
+    // Read and reset statistics atomically
+    uint64_t req = instance->request_count_.exchange(0, std::memory_order_relaxed);
+    uint64_t succ = instance->success_count_.exchange(0, std::memory_order_relaxed);
+    uint64_t fail = instance->failed_count_.exchange(0, std::memory_order_relaxed);
+    int64_t resp_time = instance->total_response_time_ms_.exchange(0, std::memory_order_relaxed);
+    
+    total_req += req;
+    total_succ += succ;
+    total_fail += fail;
+    total_resp_time += resp_time;
+  }
+  
+  // Aggregate to connections statistics
+  if (total_req > 0) {
+    connections->statistics_.total_requests.fetch_add(total_req, std::memory_order_relaxed);
+    connections->statistics_.success_requests.fetch_add(total_succ, std::memory_order_relaxed);
+    connections->statistics_.failed_requests.fetch_add(total_fail, std::memory_order_relaxed);
+    connections->statistics_.total_response_time_ms.fetch_add(total_resp_time, std::memory_order_relaxed);
+    
+    common::log.debug("aggregated stats for connections %s: req=%llu, succ=%llu, fail=%llu, avg_time=%lldms",
+                      connections->data_.uri.c_str(),
+                      (unsigned long long)total_req, (unsigned long long)total_succ, (unsigned long long)total_fail,
+                      total_req > 0 ? (long long)(total_resp_time / total_req) : 0LL);
+  }
+  
+  // Then, remove closed upstreams and perform health checks
+  size_t removed_count = 0;
+  for (auto it = instances_to_check.begin(); it != instances_to_check.end();) {
+    auto instance = *it;
+    
+    // Check if upstream is open
+    bool is_open = co_await instance->is_open();
+    if (!is_open) {
+      // Remove closed instance
+      std::lock_guard<std::mutex> lock(connections->mutex_);
+      auto inst_it = std::find(connections->instances_.begin(), 
+                               connections->instances_.end(), instance);
+      if (inst_it != connections->instances_.end()) {
+        connections->instances_.erase(inst_it);
+        connections->last_check_times_.erase(instance);
+        removed_count++;
+      }
+      it = instances_to_check.erase(it);
+      continue;
+    }
+    
+    // Perform health check if enabled
+    if (instance->check_enabled()) {
+      auto time_since_check = std::chrono::duration_cast<std::chrono::seconds>(
+          now - connections->last_check_times_[instance]).count();
+      
+      // Check if it's time for a health check
+      if (connections->last_check_times_.find(instance) == connections->last_check_times_.end() ||
+          time_since_check >= instance->check_interval()) {
+        
+        // Update last check time
+        connections->last_check_times_[instance] = now;
+        
+        // Perform health check using upstream->check() method
+        try {
+          bool check_passed = co_await instance->check();
+          
+          if (!check_passed) {
+            // Health check failed
+            // The connection should already be closed by check() on failure
+            // It will be removed in the next check cycle
+            common::log.warning("group '%s': health check failed for %s",
+                                name().c_str(), connections->data_.uri.c_str());
+          }
+          
+        } catch (const std::exception &e) {
+          // Health check error
+          common::log.warning("group '%s': health check error for %s: %s",
+                              name().c_str(), connections->data_.uri.c_str(), e.what());
+        }
+      }
+    }
+    
+    ++it;
+  }
+  
+  if (removed_count > 0) {
+    common::log.debug("group '%s': removed %zu closed/failed instances from connections %s",
+                      name().c_str(), removed_count, connections->data_.uri.c_str());
+  }
+  
+  // If all upstreams removed, switch to degraded
+  if (connections->get_instance_count() == 0) {
+    connections->status_ = connection_status::degraded;
+    connections->status_change_time_ = now;
+    connections->attempt_count_ = 0;
+    common::log.warning("group '%s': connections %s switched to degraded (all instances closed/failed)",
+                        name().c_str(), connections->data_.uri.c_str());
+  }
+}
+
+// Recover degraded connections: attempt to create and open a new instance
+asio::awaitable<void> dns_pool_group::recover_degraded_connections(
+    std::shared_ptr<dns_pool_connections> connections,
+    std::chrono::steady_clock::time_point now) {
+  
+  auto time_since_change = std::chrono::duration_cast<std::chrono::seconds>(
+      now - connections->status_change_time_).count();
+  auto time_since_attempt = std::chrono::duration_cast<std::chrono::seconds>(
+      now - connections->last_attempt_time_).count();
+  
+  // Try every 15 seconds after status change
+  if (time_since_change >= 15 && time_since_attempt >= 15) {
+    connections->last_attempt_time_ = now;
+    connections->attempt_count_++;
+    
+    common::log.debug("group '%s': attempting to recover degraded connections %s (attempt %zu/5)",
+                      name().c_str(), connections->data_.uri.c_str(), 
+                      connections->attempt_count_);
+    
+    auto instance = connections->create_single_instance();
+    if (instance) {
+      bool open_success = false;
+      try {
+        open_success = co_await instance->open();
+      } catch (const std::exception &e) {
+        common::log.debug("group '%s': exception when opening degraded upstream %s: %s",
+                          name().c_str(), connections->data_.uri.c_str(), e.what());
+      }
+      
+      if (open_success) {
+        // Successfully opened (validated in upstream->open for TLS/HTTPS)
+        {
+          std::lock_guard<std::mutex> lock(connections->mutex_);
+          connections->instances_.push_back(instance);
+          // Initialize last_check_time
+          connections->last_check_times_[instance] = now;
+        }
+        connections->status_ = connection_status::active;
+        connections->status_change_time_ = now;
+        connections->attempt_count_ = 0;
+        common::log.info("group '%s': connections %s recovered to active",
+                         name().c_str(), connections->data_.uri.c_str());
+        
+        // Reset cumulative counters for fair competition after recovery
+        reset_all_cumulative_counters();
+      } else {
+        // Check if reached max attempts
+        if (connections->attempt_count_ >= 5) {
+          connections->status_ = connection_status::offline;
+          connections->status_change_time_ = now;
+          connections->attempt_count_ = 0;
+          common::log.warning("group '%s': connections %s switched to offline (5 failed attempts)",
+                              name().c_str(), connections->data_.uri.c_str());
+        }
+      }
+    } else {
+      if (connections->attempt_count_ >= 5) {
+        connections->status_ = connection_status::offline;
+        connections->status_change_time_ = now;
+        connections->attempt_count_ = 0;
+        common::log.warning("group '%s': connections %s switched to offline (5 failed attempts)",
+                            name().c_str(), connections->data_.uri.c_str());
+      }
+    }
+  }
+}
+
+// Recover offline connections: attempt to create and open a new instance
+asio::awaitable<void> dns_pool_group::recover_offline_connections(
+    std::shared_ptr<dns_pool_connections> connections,
+    std::chrono::steady_clock::time_point now) {
+  
+  auto time_since_change = std::chrono::duration_cast<std::chrono::seconds>(
+      now - connections->status_change_time_).count();
+  auto time_since_attempt = std::chrono::duration_cast<std::chrono::seconds>(
+      now - connections->last_attempt_time_).count();
+  
+  // Try every 120 seconds after status change
+  if (time_since_change >= 120 && time_since_attempt >= 120) {
+    connections->last_attempt_time_ = now;
+    connections->attempt_count_++;
+    
+    common::log.debug("group '%s': attempting to recover offline connections %s (attempt %zu)",
+                      name().c_str(), connections->data_.uri.c_str(), 
+                      connections->attempt_count_);
+    
+    auto instance = connections->create_single_instance();
+    if (instance) {
+      bool open_success = false;
+      try {
+        open_success = co_await instance->open();
+      } catch (const std::exception &e) {
+        common::log.debug("group '%s': exception when opening offline upstream %s: %s",
+                          name().c_str(), connections->data_.uri.c_str(), e.what());
+      }
+      
+      if (open_success) {
+        // Successfully opened (validated in upstream->open for TLS/HTTPS)
+        {
+          std::lock_guard<std::mutex> lock(connections->mutex_);
+          connections->instances_.push_back(instance);
+          // Initialize last_check_time
+          connections->last_check_times_[instance] = now;
+        }
+        connections->status_ = connection_status::active;
+        connections->status_change_time_ = now;
+        connections->attempt_count_ = 0;
+        common::log.info("group '%s': connections %s recovered from offline to active",
+                         name().c_str(), connections->data_.uri.c_str());
+        
+        // Reset cumulative counters for fair competition after recovery
+        reset_all_cumulative_counters();
+      }
+    }
+  }
 }
 
 std::shared_ptr<dns_pool_group>

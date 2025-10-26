@@ -48,7 +48,7 @@ public:
   std::atomic<uint64_t> failed_count_{0};
   std::atomic<int64_t> total_response_time_ms_{0};  // Sum of all response times
   
-  // Cumulative request counter (never reset, used for load balancing)
+  // Cumulative request counter
   std::atomic<uint64_t> cumulative_requests_{0};
   
   // Health check domains (parsed from comma-separated string)

@@ -12,7 +12,6 @@ cmake_minimum_required(VERSION 3.18)
 project(dns-gateway VERSION 1.0)
 
 set(SOURCES
-    lib/CxxUrl/url.cpp
     main.cpp  
 )
 
@@ -29,6 +28,7 @@ set(DNS_SOURCES
     dns_static.cpp
     dns_upstream.cpp
     dns_upstream_pool.cpp
+    dns_utils.cpp
     operation.cpp
 )
 
@@ -72,9 +72,9 @@ set(OPENSSL_SSL_LIBRARY "${OPENSSL_ROOT_DIR}/libssl.a")
 set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_ROOT_DIR}/libcrypto.a")
 set(OPENSSL_LIBRARIES "${OPENSSL_SSL_LIBRARY}" "${OPENSSL_CRYPTO_LIBRARY}")
 
-# Find OpenSSL (optional, for validation)
-# find_package(OpenSSL REQUIRED)
-
+# Full static linking for embedded systems
+# Note: This causes linker warnings about dlopen, getaddrinfo, gethostbyname
+# These warnings are safe to ignore if the target system has the same glibc version
 set(CMAKE_EXE_LINKER_FLAGS "-static")
 
 # Link OpenSSL statically

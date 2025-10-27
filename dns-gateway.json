@@ -1,5 +1,4 @@
 {
-  "max_works": 1,
   "min_pools": 5,
   "max_pools": 50,
   "max_cache": 100,

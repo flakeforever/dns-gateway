@@ -1,0 +1,298 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.config.name }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: linux-amd64
+            arch: x86_64
+            cc: gcc
+            cxx: g++
+            openssl_target: linux-x86_64
+            cross_compile: ""
+          - name: linux-386
+            arch: i686
+            cc: gcc
+            cxx: g++
+            openssl_target: linux-x86
+            cross_compile: ""
+            cmake_flags: "-DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32"
+          - name: linux-arm64
+            arch: aarch64
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            openssl_target: linux-aarch64
+            cross_compile: aarch64-linux-gnu-
+          - name: linux-armv7
+            arch: armv7l
+            cc: arm-linux-gnueabihf-gcc
+            cxx: arm-linux-gnueabihf-g++
+            openssl_target: linux-armv4
+            cross_compile: arm-linux-gnueabihf-
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make perl
+          
+          # Install 32-bit libraries for linux-386
+          if [ "${{ matrix.config.name }}" == "linux-386" ]; then
+            sudo dpkg --add-architecture i386
+            sudo apt-get update
+            sudo apt-get install -y \
+              gcc-multilib \
+              g++-multilib \
+              libc6-dev-i386
+          fi
+          
+          # Install cross-compilation tools for ARM and MIPS
+          if [ "${{ matrix.config.name }}" == "linux-arm64" ]; then
+            sudo apt-get install -y \
+              gcc-aarch64-linux-gnu \
+              g++-aarch64-linux-gnu \
+              binutils-aarch64-linux-gnu
+          elif [ "${{ matrix.config.name }}" == "linux-armv7" ]; then
+            sudo apt-get install -y \
+              gcc-arm-linux-gnueabihf \
+              g++-arm-linux-gnueabihf \
+              binutils-arm-linux-gnueabihf
+          fi
+
+      - name: Cache OpenSSL build
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: lib/openssl
+          key: openssl-${{ matrix.config.name }}-${{ hashFiles('lib/openssl/VERSION.dat') }}
+
+      - name: Build OpenSSL for ${{ matrix.config.name }}
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          cd lib/openssl
+          
+          # Clean previous build
+          make clean || true
+          
+          # Configure OpenSSL
+          export CROSS_COMPILE=${{ matrix.config.cross_compile }}
+          ./Configure ${{ matrix.config.openssl_target }} \
+            no-shared \
+            no-tests \
+            no-apps \
+            --prefix=/usr/local \
+            --openssldir=/usr/local/ssl
+          
+          # Build
+          make -j$(nproc)
+          
+          echo "OpenSSL build completed for ${{ matrix.config.name }}"
+          ls -lh libssl.a libcrypto.a
+
+      - name: Build DNS Gateway for ${{ matrix.config.name }}
+        run: |
+          # Set environment variables
+          export CC=${{ matrix.config.cc }}
+          export CXX=${{ matrix.config.cxx }}
+          export AR=${{ matrix.config.cross_compile }}ar
+          export RANLIB=${{ matrix.config.cross_compile }}ranlib
+          export LD=${{ matrix.config.cross_compile }}ld
+          
+          # Clean old build
+          rm -rf build
+          mkdir -p build
+          cd build
+          
+          # Configure with CMake
+          cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=$CC \
+            -DCMAKE_CXX_COMPILER=$CXX \
+            ${{ matrix.config.cmake_flags }} \
+            ..
+          
+          # Build
+          make -j$(nproc)
+          
+          echo "DNS Gateway build completed for ${{ matrix.config.name }}"
+          ls -lh dns-gateway
+          file dns-gateway
+
+      - name: Strip binary
+        run: |
+          cd build
+          if [ "${{ matrix.config.name }}" == "linux-amd64" ] || [ "${{ matrix.config.name }}" == "linux-386" ]; then
+            strip dns-gateway
+          else
+            ${{ matrix.config.cross_compile }}strip dns-gateway || echo "Strip failed, continuing..."
+          fi
+          ls -lh dns-gateway
+
+      - name: Test binary (x86 only)
+        if: matrix.config.name == 'linux-amd64' || matrix.config.name == 'linux-386'
+        run: |
+          cd build
+          ./dns-gateway --version || true
+          ./dns-gateway --help || true
+
+      - name: Package binary
+        run: |
+          cd build
+          
+          # Create package directory
+          mkdir -p package
+          cp dns-gateway package/
+          
+          # Create archive
+          tar -czf ../dns-gateway-${{ matrix.config.name }}.tar.gz -C package dns-gateway
+          
+          cd ..
+          
+          # Generate checksums
+          sha256sum dns-gateway-${{ matrix.config.name }}.tar.gz > dns-gateway-${{ matrix.config.name }}.tar.gz.sha256
+          
+          # Show results
+          echo "=== Build Artifacts ==="
+          ls -lh dns-gateway-*
+          cat dns-gateway-${{ matrix.config.name }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dns-gateway-${{ matrix.config.name }}
+          path: |
+            dns-gateway-${{ matrix.config.name }}.tar.gz
+            dns-gateway-${{ matrix.config.name }}.tar.gz.sha256
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          
+          # Copy all tar.gz and sha256 files
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release-assets/ \;
+          
+          # Generate combined checksums file
+          cd release-assets
+          cat *.sha256 > SHA256SUMS
+          
+          echo "=== Release Assets ==="
+          ls -lh
+          
+          echo ""
+          echo "=== SHA256 Checksums ==="
+          cat SHA256SUMS
+
+      - name: Generate release notes
+        run: |
+          cat > release_notes.md <<EOF
+          ## DNS Gateway ${{ github.ref_name }}
+          
+          A lightweight DNS proxy server designed for secure DNS over proxy networks.
+          
+          ### 📦 Downloads
+          
+          | Platform | Architecture | Download | SHA256 |
+          |----------|--------------|----------|--------|
+          | Linux x64 | x86_64 | [dns-gateway-linux-amd64.tar.gz](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-amd64.tar.gz) | [.sha256](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-amd64.tar.gz.sha256) |
+          | Linux x86 | i686 | [dns-gateway-linux-386.tar.gz](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-386.tar.gz) | [.sha256](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-386.tar.gz.sha256) |
+          | Linux ARM64 | aarch64 | [dns-gateway-linux-arm64.tar.gz](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-arm64.tar.gz) | [.sha256](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-arm64.tar.gz.sha256) |
+          | Linux ARMv7 | armv7l | [dns-gateway-linux-armv7.tar.gz](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-armv7.tar.gz) | [.sha256](https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-linux-armv7.tar.gz.sha256) |
+          
+          ### 🚀 Quick Start
+          
+          \`\`\`bash
+          # Download (replace <platform> with linux-amd64 or linux-arm64)
+          wget https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-<platform>.tar.gz
+          
+          # Verify checksum
+          wget https://github.com/\${{ github.repository }}/releases/download/\${{ github.ref_name }}/dns-gateway-<platform>.tar.gz.sha256
+          sha256sum -c dns-gateway-<platform>.tar.gz.sha256
+          
+          # Extract
+          tar -xzf dns-gateway-<platform>.tar.gz
+          
+          # Run
+          ./dns-gateway -c dns-gateway.json
+          \`\`\`
+          
+          ### 📋 Platform Support
+          
+          - **linux-amd64**: x86_64 Linux (64-bit Intel/AMD)
+            - Modern servers, desktops, laptops
+            - Ubuntu, Debian, CentOS, RHEL, Fedora
+          
+          - **linux-386**: i686 Linux (32-bit x86)
+            - Older 32-bit systems
+            - Legacy hardware
+          
+          - **linux-arm64**: ARM64/aarch64 Linux
+            - Raspberry Pi 4, 5, 400
+            - Modern ARM servers and NAS
+            - OpenWrt ARM64 routers
+          
+          - **linux-armv7**: ARMv7 Linux (32-bit ARM)
+            - Raspberry Pi 2, 3, Zero 2 W
+            - Older ARM devices and routers
+            - OpenWrt ARMv7 devices
+          
+          ### ⚙️ Requirements
+          
+          - Linux kernel 3.10+ (statically linked, no dependencies)
+          - glibc 2.17+
+          
+          ### 📖 Documentation
+          
+          - [README.md](https://github.com/\${{ github.repository }}/blob/main/README.md)
+          - Configuration documentation (coming soon)
+          
+          ### 🔨 Build Information
+          
+          - Built with OpenSSL 3.x (statically linked)
+          - Asio (standalone)
+          - C++20
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

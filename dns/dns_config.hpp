@@ -59,7 +59,6 @@ struct dns_route_data {
 
 class dns_config {
 public:
-  int max_works;
   int min_pools;
   int max_pools;
   int max_cache;

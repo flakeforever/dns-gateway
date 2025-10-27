@@ -90,7 +90,7 @@ bool parse_arguments(int argc, char *argv[]) {
 }
 
 void print_config(const dns::dns_config &config) {
-  std::cout << "max_works: " << config.max_works << std::endl;
+  // max_works is deprecated (using single-threaded io_context now)
   std::cout << "min_pools: " << config.min_pools << std::endl;
   std::cout << "max_pools: " << config.max_pools << std::endl;
   std::cout << "max_cache: " << config.max_cache << std::endl;
@@ -331,21 +331,22 @@ int main(int argc, char *argv[]) {
 
     init_logger(common::log, config);
 
-    asio::thread_pool thread_pool(config.max_works);
-    asio::signal_set signals(thread_pool.get_executor(), SIGINT, SIGTERM);
+    // Use single-threaded io_context instead of thread_pool
+    asio::io_context io_context;
+    asio::signal_set signals(io_context, SIGINT, SIGTERM);
     dns::dns_gateway *gateway =
-        create_gateway(thread_pool.get_executor(), config);
+        create_gateway(io_context.get_executor(), config);
 
     // set signals
     co_spawn(
-        thread_pool.get_executor(),
+        io_context,
         [&]() -> asio::awaitable<void> {
           co_await signals.async_wait(asio::use_awaitable);
 
           gateway->stop();
           co_await gateway->wait_terminated();
 
-          thread_pool.stop();
+          io_context.stop();
         },
         detached);
 
@@ -356,8 +357,6 @@ int main(int argc, char *argv[]) {
       if (status) {
         // Initialize gateway (sets active, initializes upstream pool, starts checker)
         co_await gateway->start();
-        
-        common::log.info("dns-gateway is running.");
         co_await gateway->run_process();
       } else {
         common::log.error("Failed to initialize dns-gateway.");
@@ -365,8 +364,10 @@ int main(int argc, char *argv[]) {
     };
 
     // start dns gateway
-    co_spawn(thread_pool.get_executor(), handle_process, detached);
-    thread_pool.join();
+    co_spawn(io_context, handle_process, detached);
+    
+    // Run the event loop (blocks until io_context.stop() is called)
+    io_context.run();
 
     return 0;
   } catch (std::exception &e) {

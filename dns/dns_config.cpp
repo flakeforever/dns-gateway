@@ -50,15 +50,6 @@ bool load_config(const std::string &config_file, dns_config &config) {
     return false;
   }
 
-  if (obj.contains("max_works") && obj["max_works"].is_number()) {
-    config.max_works = obj["max_works"].get<int>();
-
-    if (config.max_works <= 0) {
-      std::cout << "Invalid config format: max_works cannot be set to \""
-                << config.max_works << "\"." << std::endl;
-      return false;
-    }
-  }
   if (obj.contains("max_pools") && obj["max_pools"].is_number()) {
     config.max_pools = obj["max_pools"].get<int>();
   }

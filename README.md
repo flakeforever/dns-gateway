@@ -40,7 +40,7 @@ While general DNS privacy tools work well in direct network environments, DNS Ga
 
 ### ⚡ Performance & Efficiency
 
-- **HTTP/2 multiplexing**: Single connection handles 200+ concurrent requests with zero packet loss
+- **HTTP/2 multiplexing**: Single connection handles 200+ concurrent requests
 - **High throughput**: 20,000 QPS theoretical capacity (@10ms latency), 1,000+ QPS (@200ms via proxy)
 - **Object pooling**: Configurable DNS request object pool (default 200) controls max concurrency
 - **Single-threaded event loop**: Asio coroutine-based async I/O, minimal lock contention
@@ -110,33 +110,68 @@ Synchronization approach:
   - Most operations are naturally serialized by single-threaded execution
 ```
 
-### Connection Pool & Multiplexing Strategy
+### Upstream Protocol Comparison
 
-```
-HTTP/2 multiplexing advantages:
-  ✓ Single TCP connection for all concurrent requests
-  ✓ No head-of-line blocking (stream-level flow control)
-  ✓ Minimal connection overhead even through proxies
-  ✓ 200+ concurrent DNS queries with 0% packet loss (tested)
+#### Multiplexing Support
 
-Object pool concurrency control:
-  - Configurable max concurrent requests (default: 200)
-  - Pre-allocated request objects minimize allocations
-  - Back-pressure mechanism prevents overload
-  - Throughput: 20,000 QPS @ 10ms (theoretical), 1,000+ QPS @ 200ms (via proxy)
+| Protocol | Multiplexing | Concurrency Model | Configuration |
+|----------|-------------|-------------------|---------------|
+| **UDP** | ✅ Yes | Object pool | `max_concurrent` (default: 200) |
+| **HTTP/1.1 TLS** | ❌ No | Multiple instances | `instances` per upstream |
+| **HTTP/2 DoH** | ✅ Yes | Object pool | `max_concurrent` (default: 200) |
 
-Benefits of multiple instances (non-HTTP/2 protocols):
-  ✓ Parallel requests to same upstream
-  ✓ Load distribution across instances  
-  ✓ Continued operation if some instances fail
-  ✓ Graceful degradation under heavy load
+**Multiplexing advantages**:
+- Single connection handles all concurrent requests
+- Lower connection overhead (especially via proxy)
+- Pre-allocated object pool minimizes allocations
+- Back-pressure mechanism prevents overload
 
-Load balancing: Least Requests algorithm
-  - Track cumulative requests per instance
-  - Route new requests to instance with lowest count
-  - Automatically favors faster-responding instances
-  - Reset counters on topology changes for fairness
-```
+**Multiple instances benefits** (HTTP/1.1):
+- Parallel requests to same upstream
+- Continued operation if some instances fail
+- Load balancing via Least Requests algorithm
+
+#### Theoretical Performance Comparison
+
+**Direct Connection (10ms average latency)**:
+
+| Protocol | Instances | Pool Size | Total Concurrency | Theoretical QPS | Notes |
+|----------|-----------|-----------|-------------------|----------------|-------|
+| UDP | 1 | 10 | 10 | 1,000 QPS | Basic config |
+| UDP | 1 | 200 | 200 | 20,000 QPS | High concurrency |
+| UDP | 5 | 200 | 1,000 | 100,000 QPS | **Multiplied effect** |
+| HTTP/1.1 TLS | 10 | - | 10 | 1,000 QPS | No multiplexing |
+| HTTP/1.1 TLS | 100 | - | 100 | 10,000 QPS | Impractical (high overhead) |
+| HTTP/2 DoH | 1 | 10 | 10 | 1,000 QPS | Basic config |
+| HTTP/2 DoH | 1 | 200 | 200 | 20,000 QPS | High concurrency |
+| HTTP/2 DoH | 5 | 200 | 1,000 | 100,000 QPS | **Multiplied effect** |
+
+**Via Proxy (100ms average latency)**:
+
+| Protocol | Instances | Pool Size | Total Concurrency | Theoretical QPS | Notes |
+|----------|-----------|-----------|-------------------|----------------|-------|
+| UDP | 1 | 10 | 10 | 100 QPS | Basic config |
+| UDP | 1 | 200 | 200 | 2,000 QPS | High concurrency |
+| UDP | 5 | 200 | 1,000 | 10,000 QPS | **Multiplied effect** |
+| HTTP/1.1 TLS | 10 | - | 10 | 100 QPS | No multiplexing |
+| HTTP/1.1 TLS | 100 | - | 100 | 1,000 QPS | High overhead |
+| HTTP/2 DoH | 1 | 10 | 10 | 100 QPS | Basic config |
+| HTTP/2 DoH | 1 | 200 | 200 | 2,000 QPS | High concurrency |
+| HTTP/2 DoH | 5 | 200 | 1,000 | 10,000 QPS | **Multiplied effect** |
+
+**Key Insights**:
+- **Multiplexing protocols (UDP/HTTP/2)**: Support **both** pool size and multiple instances
+  - Total concurrency = instances × pool size
+  - 5 instances × 200 pool = 1,000 concurrent requests
+- **HTTP/1.1**: Only instance count affects concurrency (no pool multiplier)
+  - Requires 100 instances to match 1 HTTP/2 instance with 100 pool size
+- **Proxy scenario**: Multiplexing advantage is even more pronounced
+  - HTTP/2 (5 instances × 200 pool) = 10,000 QPS
+  - HTTP/1.1 (100 instances) = 1,000 QPS (10× more connections for same QPS)
+
+**Formula**: `QPS = Total Concurrency / Average Latency`
+- **Multiplexing**: Total Concurrency = instances × pool size
+- **Non-multiplexing**: Total Concurrency = instance count
 
 ### Health Check Mechanism
 

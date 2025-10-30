@@ -10,100 +10,137 @@
 
 cmake_minimum_required(VERSION 3.18)
 
-# Detect cross-compilation from CROSS_COMPILE environment variable
+# ========================================
+# Build OpenSSL FIRST (before project() and compiler detection)
+# ========================================
+set(OPENSSL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/lib/openssl")
+set(OPENSSL_SSL_LIBRARY "${OPENSSL_SOURCE_DIR}/libssl.a")
+set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_SOURCE_DIR}/libcrypto.a")
+
+# Check if OpenSSL libraries exist, build if not
+if(NOT EXISTS "${OPENSSL_SSL_LIBRARY}" OR NOT EXISTS "${OPENSSL_CRYPTO_LIBRARY}")
+    message(STATUS "========================================")
+    message(STATUS "OpenSSL libraries not found, building...")
+    message(STATUS "========================================")
+    
+    # Determine target architecture
+    # Check if building 32-bit on 64-bit system (linux-386)
+    if(CMAKE_C_FLAGS MATCHES "-m32")
+        set(TARGET_ARCH "i686")
+        set(OPENSSL_CFLAGS "-m32")
+        message(STATUS "Detected 32-bit build flags (-m32)")
+    else()
+        # Try to extract from compiler name (for cross-compilation)
+        get_filename_component(COMPILER_NAME "${CMAKE_C_COMPILER}" NAME)
+        if(COMPILER_NAME MATCHES "^(x86_64|aarch64|arm|i686|mips64|mips)-")
+            set(TARGET_ARCH "${CMAKE_MATCH_1}")
+            message(STATUS "Detected architecture from compiler: ${TARGET_ARCH}")
+        else()
+            # Fall back to system processor
+            set(TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+            message(STATUS "Using system processor: ${TARGET_ARCH}")
+        endif()
+        set(OPENSSL_CFLAGS "")
+    endif()
+    
+    if(TARGET_ARCH MATCHES "x86_64|amd64|AMD64")
+        set(OPENSSL_TARGET "linux-x86_64")
+    elseif(TARGET_ARCH MATCHES "aarch64|arm64")
+        set(OPENSSL_TARGET "linux-aarch64")
+    elseif(TARGET_ARCH MATCHES "armv7")
+        set(OPENSSL_TARGET "linux-armv4")
+    elseif(TARGET_ARCH MATCHES "i386|i686")
+        set(OPENSSL_TARGET "linux-x86")
+    else()
+        set(OPENSSL_TARGET "linux-generic64")
+    endif()
+    
+    message(STATUS "Target: ${OPENSSL_TARGET}")
+    
+    # Simple build - let OpenSSL detect the toolchain from CROSS_COMPILE
+    message(STATUS "Building OpenSSL...")
+    
+    # Set CFLAGS for OpenSSL if needed (e.g., -m32 for linux-386)
+    if(OPENSSL_CFLAGS)
+        execute_process(
+            COMMAND bash -c "CFLAGS='${OPENSSL_CFLAGS}' ./Configure ${OPENSSL_TARGET} no-shared no-tests no-apps"
+            WORKING_DIRECTORY ${OPENSSL_SOURCE_DIR}
+            RESULT_VARIABLE CONFIG_RESULT
+        )
+    else()
+        execute_process(
+            COMMAND ./Configure ${OPENSSL_TARGET} no-shared no-tests no-apps
+            WORKING_DIRECTORY ${OPENSSL_SOURCE_DIR}
+            RESULT_VARIABLE CONFIG_RESULT
+        )
+    endif()
+    
+    if(NOT CONFIG_RESULT EQUAL 0)
+        message(FATAL_ERROR "OpenSSL configure failed!")
+    endif()
+    
+    execute_process(
+        COMMAND make -j4
+        WORKING_DIRECTORY ${OPENSSL_SOURCE_DIR}
+        RESULT_VARIABLE BUILD_RESULT
+    )
+    
+    if(NOT BUILD_RESULT EQUAL 0)
+        message(FATAL_ERROR "OpenSSL build failed!")
+    endif()
+    
+    # Verify libraries were built
+    if(NOT EXISTS "${OPENSSL_SSL_LIBRARY}" OR NOT EXISTS "${OPENSSL_CRYPTO_LIBRARY}")
+        message(FATAL_ERROR "OpenSSL libraries not found after build!")
+    endif()
+    
+    message(STATUS "OpenSSL build completed successfully")
+endif()
+
+# ========================================
+# NOW set cross-compilation tools (after OpenSSL built)
+# ========================================
 if(DEFINED ENV{CROSS_COMPILE})
     set(CROSS_PREFIX $ENV{CROSS_COMPILE})
-    # Extract architecture from CROSS_COMPILE (e.g., aarch64-linux-gnu- -> aarch64)
-    string(REGEX REPLACE "^([^-]+)-.*" "\\1" DETECTED_ARCH "${CROSS_PREFIX}")
+    message(STATUS "Detected CROSS_COMPILE: ${CROSS_PREFIX}")
     
-    set(CMAKE_SYSTEM_NAME Linux)
-    set(CMAKE_SYSTEM_PROCESSOR ${DETECTED_ARCH})
     set(CMAKE_C_COMPILER ${CROSS_PREFIX}gcc)
     set(CMAKE_CXX_COMPILER ${CROSS_PREFIX}g++)
     set(CMAKE_AR ${CROSS_PREFIX}ar)
     set(CMAKE_RANLIB ${CROSS_PREFIX}ranlib)
     set(CMAKE_STRIP ${CROSS_PREFIX}strip)
+    
+    string(REGEX REPLACE "^([^-]+)-.*" "\\1" DETECTED_ARCH "${CROSS_PREFIX}")
+    set(CMAKE_SYSTEM_NAME Linux)
+    set(CMAKE_SYSTEM_PROCESSOR ${DETECTED_ARCH})
 endif()
 
+# ========================================
+# Initialize project (after OpenSSL and compiler setup)
+# ========================================
 project(dns-gateway VERSION 3.1)
-
-# ========================================
-# Build OpenSSL first
-# ========================================
-include(ExternalProject)
-
-# Detect architecture for OpenSSL config
-# In cross-compilation, CMAKE_SYSTEM_PROCESSOR may be set from compiler detection
-set(TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
-
-if(CMAKE_CROSSCOMPILING)
-    # Extract architecture from compiler name
-    # e.g., aarch64-linux-gnu-gcc -> aarch64
-    get_filename_component(COMPILER_NAME "${CMAKE_C_COMPILER}" NAME)
-    if(COMPILER_NAME MATCHES "^([^-]+)-")
-        set(TARGET_ARCH "${CMAKE_MATCH_1}")
-    endif()
-endif()
-
-if(TARGET_ARCH MATCHES "x86_64|amd64|AMD64")
-    set(OPENSSL_ARCH "linux-x86_64")
-elseif(TARGET_ARCH MATCHES "aarch64|arm64")
-    set(OPENSSL_ARCH "linux-aarch64")
-elseif(TARGET_ARCH MATCHES "armv7")
-    set(OPENSSL_ARCH "linux-armv4")
-elseif(TARGET_ARCH MATCHES "i386|i686")
-    set(OPENSSL_ARCH "linux-x86")
-elseif(TARGET_ARCH MATCHES "mips64")
-    set(OPENSSL_ARCH "linux64-mips64")
-elseif(TARGET_ARCH MATCHES "mips")
-    set(OPENSSL_ARCH "linux-mips32")
-else()
-    message(WARNING "Unknown architecture ${TARGET_ARCH}, using linux-generic32")
-    set(OPENSSL_ARCH "linux-generic32")
-endif()
-
-set(OPENSSL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/lib/openssl")
-
-# No extra configure args needed - rely on environment variables from build script
-set(OPENSSL_CONFIGURE_EXTRA_ARGS "")
-
-message(STATUS "========================================")
-message(STATUS "OpenSSL Configuration:")
-message(STATUS "  Architecture:    ${OPENSSL_ARCH}")
-message(STATUS "  Cross-compile:   ${CMAKE_CROSSCOMPILING}")
-if(CMAKE_CROSSCOMPILING)
-    message(STATUS "  Cross prefix:    ${OPENSSL_CROSS_COMPILE}")
-    message(STATUS "  C Compiler:      ${CMAKE_C_COMPILER}")
-endif()
-message(STATUS "  Source:          ${OPENSSL_SOURCE_DIR}")
-message(STATUS "  Build in place:  YES (no install)")
-message(STATUS "========================================")
-
-# Build OpenSSL in-source, no install step
-# OpenSSL will automatically use ${CROSS_COMPILE}gcc based on environment variable
-ExternalProject_Add(openssl_build
-    SOURCE_DIR ${OPENSSL_SOURCE_DIR}
-    CONFIGURE_COMMAND ${OPENSSL_SOURCE_DIR}/Configure
-        ${OPENSSL_ARCH}
-        no-shared
-        no-tests
-        no-apps
-    BUILD_COMMAND make -j
-    INSTALL_COMMAND ""
-    BUILD_IN_SOURCE 1
-    LOG_CONFIGURE 1
-    LOG_BUILD 1
-)
 
 set(OPENSSL_ROOT_DIR "${OPENSSL_SOURCE_DIR}")
 set(OPENSSL_INCLUDE_DIR "${OPENSSL_SOURCE_DIR}/include")
-set(OPENSSL_SSL_LIBRARY "${OPENSSL_SOURCE_DIR}/libssl.a")
-set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_SOURCE_DIR}/libcrypto.a")
+
+message(STATUS "========================================")
+message(STATUS "OpenSSL Configuration:")
+message(STATUS "  Include:         ${OPENSSL_INCLUDE_DIR}")
+message(STATUS "  SSL Library:     ${OPENSSL_SSL_LIBRARY}")
+message(STATUS "  Crypto Library:  ${OPENSSL_CRYPTO_LIBRARY}")
+message(STATUS "========================================")
 
 # ========================================
 # nghttp2 static library
 # ========================================
 message(STATUS "Configuring nghttp2...")
+
+# Ensure cross-compilation tools are available to nghttp2
+if(CMAKE_CROSSCOMPILING)
+    message(STATUS "  nghttp2 cross-compile tools:")
+    message(STATUS "    AR:      ${CMAKE_AR}")
+    message(STATUS "    RANLIB:  ${CMAKE_RANLIB}")
+endif()
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
@@ -192,8 +229,7 @@ endif()
 # ========================================
 # Dependencies
 # ========================================
-# Ensure OpenSSL is built before dns-gateway
-add_dependencies(dns-gateway openssl_build)
+# Note: OpenSSL is pre-built by workflow or manually
 
 # Full static linking for embedded systems
 # Note: This causes linker warnings about dlopen, getaddrinfo, gethostbyname

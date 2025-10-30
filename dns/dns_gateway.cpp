@@ -158,7 +158,7 @@ asio::awaitable<void> dns_gateway::start() {
     common::log.info("monitor HTTP server disabled (port not configured)");
   }
   
-  common::log.info("dns_gateway initialization completed");
+  // common::log.info("dns_gateway initialization completed");
 }
 
 void dns_gateway::stop() {
@@ -388,10 +388,10 @@ dns_gateway::handle_dns_request(dns::dns_object *dns_object) {
       // update dns cache
       co_await handle_create_cache(dns_object);
 
-      common::log.debug("response %d %s type %d to %s", dns_object->question_id_,
+      common::log.debug("response %d %s type %d from %s:%d", dns_object->question_id_,
                    dns_object->question_domain_.c_str(),
                    dns_object->question_type_,
-                   endpoint_to_string(dns_object->remote_endpoint_).c_str());
+                   dns_upstream->host().c_str(), dns_upstream->port());
 
       dns_object->buffer_length_ =
           package.dump(dns_object->buffer_, sizeof(dns_object->buffer_));
@@ -441,8 +441,12 @@ dns_gateway::dns_upstream_request(std::shared_ptr<dns_upstream> dns_upstream,
       std::chrono::milliseconds(dns::coroutine_timeout),
       [&](asio::steady_timer &timer) -> asio::awaitable<void> {
         try {
-          await_coroutine_lock lock(executor_, dns_upstream->locked_);
-          co_await lock.get_lock();
+          // Only use lock for non-multiplexing upstreams (DoT/DoH)
+          // Multiplexing upstreams (UDP) support concurrent requests
+          if (!dns_upstream->supports_multiplexing()) {
+            await_coroutine_lock lock(executor_, dns_upstream->locked_);
+            co_await lock.get_lock();
+          }
 
           bool status = co_await dns_upstream->is_open();
           if (!status) {
@@ -481,8 +485,12 @@ dns_gateway::dns_upstream_close(std::shared_ptr<dns_upstream> dns_upstream) {
       std::chrono::milliseconds(dns::coroutine_timeout),
       [&](asio::steady_timer &timer) -> asio::awaitable<void> {
         try {
-          await_coroutine_lock lock(executor_, dns_upstream->locked_);
-          co_await lock.get_lock();
+          // Only use lock for non-multiplexing upstreams (DoT/DoH)
+          // Multiplexing upstreams (UDP) can be closed concurrently
+          if (!dns_upstream->supports_multiplexing()) {
+            await_coroutine_lock lock(executor_, dns_upstream->locked_);
+            co_await lock.get_lock();
+          }
 
           co_await dns_upstream->close();
         } catch (const std::exception &e) {

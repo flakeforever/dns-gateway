@@ -7,3 +7,6 @@
 [submodule "lib/openssl"]
 	path = lib/openssl
 	url = https://github.com/openssl/openssl.git
+[submodule "lib/nghttp2"]
+	path = lib/nghttp2
+	url = https://github.com/nghttp2/nghttp2.git

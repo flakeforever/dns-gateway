@@ -482,6 +482,16 @@ asio::awaitable<int> socks_tls_client::read(char *data, uint16_t data_length) {
   }
 }
 
+asio::awaitable<int> socks_tls_client::read_some(char *data, uint16_t data_length) {
+  try {
+    co_return co_await tls_socket_.async_read_some(
+        asio::buffer(data, data_length), asio::use_awaitable);
+  } catch (const std::system_error &e) {
+    disconnect();
+    throw e;
+  }
+}
+
 asio::ssl::stream<asio::ip::tcp::socket> &socks_tls_client::get_socket() {
   return tls_socket_;
 }

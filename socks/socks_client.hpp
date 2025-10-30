@@ -138,6 +138,7 @@ public:
 
   asio::awaitable<int> write(const char *data, uint16_t data_length);
   asio::awaitable<int> read(char *data, uint16_t data_length);
+  asio::awaitable<int> read_some(char *data, uint16_t data_length);
 
   asio::ssl::stream<asio::ip::tcp::socket> &get_socket();
   bool is_connected();

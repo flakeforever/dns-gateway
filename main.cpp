@@ -270,6 +270,7 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway,
       // Create dns_upstream_data
       dns::dns_upstream_data data;
       data.uri = upstream.uri;
+      data.version = upstream.version;  // HTTP version for DoH
       data.security_verify = upstream.security_verify;
       data.ca_certificate = upstream.ca_certificate;
       data.certificate = upstream.certificate;
@@ -278,6 +279,7 @@ asio::awaitable<bool> init_gateway(dns::dns_gateway *gateway,
       data.keep_alive = upstream.keep_alive;
       data.check_enabled = upstream.check_enabled;
       data.check_interval = upstream.check_interval;
+      data.check_domains = upstream.check_domains;  // Health check domains
 
       // Add connections to pool_group (will create instances during init)
       pool_group->add_upstream(data);
@@ -319,7 +321,6 @@ int main(int argc, char *argv[]) {
     if (!parse_arguments(argc, argv)) {
       return EXIT_FAILURE;
     }
-
     if (!dns::load_config(config_file, config)) {
       return EXIT_FAILURE;
     }
@@ -369,6 +370,9 @@ int main(int argc, char *argv[]) {
     // Run the event loop (blocks until io_context.stop() is called)
     io_context.run();
 
+    // Clean up gateway
+    delete gateway;
+    
     return 0;
   } catch (std::exception &e) {
     common::log.error("Exception: %s", e.what());

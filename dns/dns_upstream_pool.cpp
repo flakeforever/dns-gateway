@@ -134,30 +134,60 @@ dns_pool_connections::create_single_instance() {
     
     case uri_scheme::https:
     case uri_scheme::doh: {
-      auto https_upstream = std::make_shared<dns_https_upstream>(
-          executor_, parsed.host, parsed.port, 
-          scheme_to_string(parsed.scheme), parsed.path);
-      
-      // Apply proxy settings
-      if (proxy.is_valid()) {
-        https_upstream->set_proxy(socks::proxy_type::socks5, 
-                                  proxy.host, proxy.port);
+      // Determine HTTP version: default 1.1, use 2 if specified
+      if (data_.version == "2") {
+        // Create HTTP/2 upstream (multiplexing)
+        auto http2_upstream = std::make_shared<dns_http2_upstream>(
+            executor_, parsed.host, parsed.port, parsed.path);
+        
+        // Apply proxy settings
+        if (proxy.is_valid()) {
+          http2_upstream->set_proxy(socks::proxy_type::socks5, 
+                                    proxy.host, proxy.port);
+        }
+        
+        // Apply HTTP/2 settings
+        http2_upstream->path(parsed.path);
+        http2_upstream->security_verify(data_.security_verify);
+        http2_upstream->ca_certificate(data_.ca_certificate);
+        http2_upstream->certificate(data_.certificate);
+        http2_upstream->private_key(data_.private_key);
+        
+        // Apply check settings
+        http2_upstream->check_enabled(data_.check_enabled);
+        http2_upstream->check_interval(data_.check_interval);
+        http2_upstream->set_check_domains(data_.check_domains);
+        
+        instance = http2_upstream;
+        common::log.info("created HTTP/2 (DoH) upstream instance: %s (version=%s)", 
+                        data_.uri.c_str(), data_.version.c_str());
+      } else {
+        // Create HTTP/1.1 upstream (default)
+        auto https_upstream = std::make_shared<dns_https_upstream>(
+            executor_, parsed.host, parsed.port, parsed.path);
+        
+        // Apply proxy settings
+        if (proxy.is_valid()) {
+          https_upstream->set_proxy(socks::proxy_type::socks5, 
+                                    proxy.host, proxy.port);
+        }
+        
+        // Apply HTTPS settings (HTTPS inherits from TLS)
+        https_upstream->keep_alive(data_.keep_alive);
+        https_upstream->security_verify(data_.security_verify);
+        https_upstream->ca_certificate(data_.ca_certificate);
+        https_upstream->certificate(data_.certificate);
+        https_upstream->private_key(data_.private_key);
+        
+        // Apply check settings
+        https_upstream->check_enabled(data_.check_enabled);
+        https_upstream->check_interval(data_.check_interval);
+        https_upstream->set_check_domains(data_.check_domains);
+        
+        instance = https_upstream;
+        common::log.info("created HTTP/1.1 (DoH) upstream instance: %s (version=%s)", 
+                        data_.uri.c_str(), data_.version.c_str());
       }
-      
-      // Apply HTTPS settings (HTTPS inherits from TLS)
-      https_upstream->keep_alive(data_.keep_alive);
-      https_upstream->security_verify(data_.security_verify);
-      https_upstream->ca_certificate(data_.ca_certificate);
-      https_upstream->certificate(data_.certificate);
-      https_upstream->private_key(data_.private_key);
-      
-      // Apply check settings
-      https_upstream->check_enabled(data_.check_enabled);
-      https_upstream->check_interval(data_.check_interval);
-      https_upstream->set_check_domains(data_.check_domains);
-      
-      instance = https_upstream;
-      common::log.info("created HTTPS upstream instance: %s", data_.uri.c_str());
       break;
     }
     
@@ -179,7 +209,9 @@ size_t dns_pool_connections::get_available_count() const {
   std::lock_guard<std::mutex> lock(mutex_);
   size_t count = 0;
   for (const auto &instance : instances_) {
-    if (!instance->locked_.load()) {
+    // Multiplexing instances are always available for concurrent requests
+    // Non-multiplexing instances (DoT/DoH) are only available if not locked
+    if (instance->supports_multiplexing() || !instance->locked_.load()) {
       count++;
     }
   }
@@ -329,9 +361,9 @@ asio::awaitable<void> dns_pool_group::balance_load() {
     co_return;
   }
 
-  common::log.debug("group '%s' load balancing: target=%zu, current=%zu, active_connections=%zu",
-                    name().c_str(), target_size_, current_instance_count, 
-                    active_connections.size());
+  // common::log.debug("group '%s' load balancing: target=%zu, current=%zu, active_connections=%zu",
+  //                   name().c_str(), target_size_, current_instance_count, 
+  //                   active_connections.size());
 
   // Dispatch to appropriate sub-method based on current state
   if (current_instance_count > target_size_) {
@@ -345,7 +377,7 @@ asio::awaitable<void> dns_pool_group::balance_load() {
     co_await scale_up(active_connections, current_instance_count);
   }
   
-  common::log.debug("group '%s' load balancing completed", name().c_str());
+  // common::log.debug("group '%s' load balancing completed", name().c_str());
 }
 
 // Scale down: remove excess instances to reach target
@@ -427,8 +459,8 @@ asio::awaitable<void> dns_pool_group::rebalance_distribution(
   }
   
   if (!needs_rebalance) {
-    common::log.debug("group '%s' already has target instances (%zu) with balanced distribution",
-                      name().c_str(), target_size_);
+    // common::log.debug("group '%s' already has target instances (%zu) with balanced distribution",
+    //                   name().c_str(), target_size_);
     co_return;
   }
   
@@ -718,13 +750,16 @@ dns_pool_group::get_next_upstream() {
   uint64_t min_requests = UINT64_MAX;
   size_t best_index = 0;
   
-  // Find the instance with the least cumulative requests that is not locked
+  // Find the instance with the least cumulative requests
   for (size_t i = 0; i < all_instances.size(); i++) {
     auto &info = all_instances[i];
     
-    // Check if instance is not locked (busy)
-    if (info.instance->locked_.load(std::memory_order_acquire)) {
-      continue;  // Skip busy instances
+    // For non-multiplexing instances (DoT/DoH), check if locked (busy)
+    // Multiplexing instances (UDP) can handle concurrent requests, no need to check
+    if (!info.instance->supports_multiplexing()) {
+      if (info.instance->locked_.load(std::memory_order_acquire)) {
+        continue;  // Skip busy instances (DoT/DoH only)
+      }
     }
     
     // Get cumulative request count (never reset)
@@ -876,7 +911,7 @@ asio::awaitable<void> dns_pool_group::handle_check() {
           now - last_balance_time).count();
       
       if (time_since_balance >= balance_interval.count()) {
-        common::log.debug("group '%s': running load balancing", name().c_str());
+        // common::log.debug("group '%s': running load balancing", name().c_str());
         co_await balance_load();
         last_balance_time = now;
       }

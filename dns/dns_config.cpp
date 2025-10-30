@@ -50,6 +50,9 @@ bool load_config(const std::string &config_file, dns_config &config) {
     return false;
   }
 
+  if (obj.contains("min_pools") && obj["min_pools"].is_number()) {
+    config.min_pools = obj["min_pools"].get<int>();
+  }
   if (obj.contains("max_pools") && obj["max_pools"].is_number()) {
     config.max_pools = obj["max_pools"].get<int>();
   }
@@ -100,6 +103,9 @@ bool load_config(const std::string &config_file, dns_config &config) {
               dns_upstream_data upstream;
               if (upstream_obj.contains("uri") && upstream_obj["uri"].is_string()) {
                 upstream.uri = upstream_obj["uri"].get<std::string>();
+              }
+              if (upstream_obj.contains("version") && upstream_obj["version"].is_string()) {
+                upstream.version = upstream_obj["version"].get<std::string>();
               }
               if (upstream_obj.contains("keep_alive") && upstream_obj["keep_alive"].is_boolean()) {
                 upstream.keep_alive = upstream_obj["keep_alive"].get<bool>();

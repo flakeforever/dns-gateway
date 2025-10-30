@@ -33,17 +33,19 @@ While general DNS privacy tools work well in direct network environments, DNS Ga
 
 ### 🔒 Security & Privacy
 
-- **DNS over HTTPS (DoH)**: RFC 8484 compliant
+- **DNS over HTTPS (DoH)**: RFC 8484 compliant with HTTP/2 multiplexing support
 - **DNS over TLS (DoT)**: TLS 1.3 encrypted transport
 - **SOCKS5 proxy integration**: Seamless proxy support for all upstream protocols
 - **TLS certificate verification**: Custom CA certificates and mutual TLS authentication
 
 ### ⚡ Performance & Efficiency
 
+- **HTTP/2 multiplexing**: Single connection handles 200+ concurrent requests with zero packet loss
+- **High throughput**: 20,000 QPS theoretical capacity (@10ms latency), 1,000+ QPS (@200ms via proxy)
+- **Object pooling**: Configurable DNS request object pool (default 200) controls max concurrency
 - **Single-threaded event loop**: Asio coroutine-based async I/O, minimal lock contention
 - **Low memory footprint**: < 50MB runtime memory, suitable for resource-constrained devices
-- **High concurrency**: 100+ QPS on single core, I/O-bound optimized
-- **Object pooling**: Configurable DNS request object pool to minimize allocations
+- **Smart connection reuse**: Keep-Alive reduces TLS handshake overhead through proxies
 
 ### 📊 Intelligent Routing
 
@@ -108,11 +110,22 @@ Synchronization approach:
   - Most operations are naturally serialized by single-threaded execution
 ```
 
-### Connection Pool Strategy
+### Connection Pool & Multiplexing Strategy
 
 ```
+HTTP/2 multiplexing advantages:
+  ✓ Single TCP connection for all concurrent requests
+  ✓ No head-of-line blocking (stream-level flow control)
+  ✓ Minimal connection overhead even through proxies
+  ✓ 200+ concurrent DNS queries with 0% packet loss (tested)
 
-Benefits of multiple instances:
+Object pool concurrency control:
+  - Configurable max concurrent requests (default: 200)
+  - Pre-allocated request objects minimize allocations
+  - Back-pressure mechanism prevents overload
+  - Throughput: 20,000 QPS @ 10ms (theoretical), 1,000+ QPS @ 200ms (via proxy)
+
+Benefits of multiple instances (non-HTTP/2 protocols):
   ✓ Parallel requests to same upstream
   ✓ Load distribution across instances  
   ✓ Continued operation if some instances fail

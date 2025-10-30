@@ -23,6 +23,7 @@
 namespace dns {
 struct dns_upstream_data {
   std::string uri;
+  std::string version = "1.1";  // HTTP version for DoH: "1.1" or "2", default "1.1"
   bool security_verify = false;
   std::string ca_certificate = "";
   std::string certificate = "";

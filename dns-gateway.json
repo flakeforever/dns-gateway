@@ -10,37 +10,43 @@
   "groups": [
     {
       "name": "local-service",
-      "pools": 5,
+      "pools": 2,
       "upstreams": [
         {
           "uri": "udp://1.1.1.1"
         },
         {
-          "uri": "udp://8.8.8.8"
+          "uri": "udp://8.8.8.8",
+          "proxy": "socks5://192.168.1.1:1080",
+          "check_enabled": true,
+          "check_interval": 45,
+          "check_domains": "dns.google"
         }
       ]
     },
     {
       "name": "security",
       "default": true,
-      "pools": 5,
+      "pools": 3,
       "upstreams": [
         {
           "uri": "doh://cloudflare-dns.com/dns-query",
+          "version": "2",
           "keep_alive": true,
           "security_verify": true,
-            "proxy": "socks5://192.168.1.1:1080",
-            "check_enabled": true,
-            "check_interval": 45,
-            "check_domains": "one.one.one.one"
+          "proxy": "socks5://192.168.1.1:1080",
+          "check_enabled": true,
+          "check_interval": 45,
+          "check_domains": "one.one.one.one"
         },
         {
-          "uri": "dot://8.8.8.8",
+          "uri": "doh://dns.google/dns-query",
+          "version": "2",
           "keep_alive": true,
           "security_verify": true,
-          "proxy": "socks5://192.168.88.1:1080",
+          "proxy": "socks5://192.168.1.1:1080",
           "check_enabled": true,
-          "check_interval": 90,
+          "check_interval": 45,
           "check_domains": "dns.google"
         },
         {
@@ -49,7 +55,7 @@
           "ca_certificate": "/etc/dns-gateway/cert/ca.cert",
           "certificate": "/etc/dns-gateway/cert/example.pem",
           "private_key": "/etc/dns-gateway/cert/key.pem",
-          "proxy": "socks5://192.168.88.1:1080",
+          "proxy": "socks5://192.168.1.1:1080",
           "check_enabled": true,
           "check_interval": 90
         }

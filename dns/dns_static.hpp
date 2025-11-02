@@ -30,7 +30,7 @@ public:
   asio::awaitable<std::vector<std::string>>
   get_static_values(const std::string &domain, dns::anwser_type type);
 
-  std::atomic_bool locked_ = false;
+  async_mutex mutex_;
 
 private:
   std::string generate_key(const std::string &domain, dns::anwser_type type);

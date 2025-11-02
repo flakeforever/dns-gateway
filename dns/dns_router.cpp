@@ -21,7 +21,8 @@ namespace dns {
 // All upstream instance management is handled by dns_upstream_pool
 dns_upstream_group::dns_upstream_group() {}
 
-dns_router::dns_router(asio::any_io_executor executor) : executor_(executor) {}
+dns_router::dns_router(asio::any_io_executor executor) 
+    : executor_(executor), mutex_(executor) {}
 
 std::shared_ptr<dns_upstream_group>
 dns_router::create_group(const std::string &name) {
@@ -54,7 +55,7 @@ void dns_router::add_route(const std::string &domain, uint8_t group_id) {
 }
 
 asio::awaitable<uint8_t> dns_router::get_route(const std::string &domain) {
-  await_coroutine_lock lock(executor_, locked_);
+  async_mutex_lock lock(mutex_);
   co_await lock.get_lock();
 
   co_return search_in_trie(root_, domain);

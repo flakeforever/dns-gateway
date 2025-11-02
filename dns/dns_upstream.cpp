@@ -17,12 +17,13 @@
 #include "dns_package.hpp"
 #include "../common/log.hpp"
 #include <sstream>
+#include <random>
 
 using asio::awaitable;
 
 namespace dns {
 dns_upstream::dns_upstream(asio::any_io_executor executor)
-    : executor_(std::move(executor)) {
+    : mutex_(executor), executor_(std::move(executor)) {
   host_ = "";
   port_ = 0;
   proxy_type_ = socks::proxy_type::none;
@@ -33,9 +34,7 @@ dns_upstream::dns_upstream(asio::any_io_executor executor)
   last_request_time_ = asio::steady_timer::clock_type::now();
 }
 
-asio::awaitable<bool> dns_upstream::send_request(const char *data,
-                                                 uint16_t data_length,
-                                                 handle_response handler) {
+asio::awaitable<bool> dns_upstream::send_request(dns::dns_object *dns_object) {
   last_request_time_ = asio::steady_timer::clock_type::now();
   co_return true;
 }
@@ -52,9 +51,45 @@ asio::awaitable<bool> dns_upstream::open() { co_return true; }
 asio::awaitable<void> dns_upstream::close() { co_return; }
 
 asio::awaitable<bool> dns_upstream::check() {
-  // Base implementation: always return true (for UDP)
-  // UDP is connectionless, no need for validation
-  co_return true;
+  // Validation check: send a test DNS query to verify connection is working
+  // This prevents servers from closing idle connections or treating as attack
+  try {
+    // Use configured check domain or auto-detect based on provider
+    std::string check_domain = get_next_check_domain();
+    
+    if (check_domain.empty()) {
+      common::log.debug("Upstream %s:%d - health check skipped: no check domain configured",
+                        host_.c_str(), port_);
+      co_return false;
+    }
+    
+    dns_package package;
+    package.add_question(check_domain.c_str(), dns::anwser_type::a);
+    
+    dns::dns_object obj;
+    obj.buffer_length_ = package.dump(obj.buffer_, sizeof(obj.buffer_));
+    
+    if (obj.buffer_length_ > 0) {
+      // Initialize object for request (required for multiplexing upstreams)
+      if (supports_multiplexing()) {
+        obj.init_for_request(executor_);
+        obj.transaction_id_ = 1;
+      }
+      
+      // Send validation request (send_request will update last_request_time_)
+      bool send_result = co_await send_request(&obj);
+      
+      if (send_result && obj.buffer_length_ > 0) {
+        co_return true;
+      }
+    }
+  } catch (const std::exception &e) {
+    const char* upstream_type = supports_multiplexing() ? "Multiplexing" : "Upstream";
+    common::log.debug("%s %s:%d - health check exception: %s",
+                      upstream_type, host_.c_str(), port_, e.what());
+  }
+  
+  co_return false;
 }
 
 void dns_upstream::record_request(bool success, std::chrono::milliseconds response_time) {
@@ -161,17 +196,16 @@ void dns_upstream::handle_exception(std::error_code error) {}
 // ========================================
 
 dns_multiplexing_upstream::dns_multiplexing_upstream(asio::any_io_executor executor)
-    : dns_upstream(executor) {
+    : dns_upstream(executor), recv_mutex_(executor_), send_mutex_(executor_) {
 }
 
 dns_multiplexing_upstream::~dns_multiplexing_upstream() {
-  // Ensure recv_loop is stopped
-  recv_active_.store(false, std::memory_order_release);
+
 }
 
 asio::awaitable<bool> dns_multiplexing_upstream::open() {
   // Check if already open (idempotent operation)
-  if (recv_active_.load(std::memory_order_acquire)) {
+  if (active_.load(std::memory_order_acquire)) {
     common::log.debug("Multiplexing upstream already open");
     co_return true;
   }
@@ -185,7 +219,7 @@ asio::awaitable<bool> dns_multiplexing_upstream::open() {
   
   // 2. Start receive loop (only if not already active)
   bool expected = false;
-  if (recv_active_.compare_exchange_strong(expected, true, std::memory_order_release)) {
+  if (active_.compare_exchange_strong(expected, true, std::memory_order_release)) {
     asio::co_spawn(executor_, 
                    [self = shared_from_this()]() { 
                      return std::static_pointer_cast<dns_multiplexing_upstream>(self)->recv_loop(); 
@@ -197,267 +231,283 @@ asio::awaitable<bool> dns_multiplexing_upstream::open() {
     common::log.debug("Multiplexing upstream recv_loop already started by another coroutine");
   }
   
+  // 3. Perform health check if enabled (after recv_loop is started)
+  if (check_enabled()) {
+    bool check_result = co_await check();
+    if (!check_result) {
+      common::log.warning("Multiplexing upstream connection validation failed, closing");
+      active_.store(false, std::memory_order_release);
+      co_await protocol_close();
+      co_return false;
+    }
+  }
+  
   co_return true;
 }
 
 asio::awaitable<void> dns_multiplexing_upstream::close() {
   common::log.warning("Multiplexing upstream close() called");
-  // Stop receive loop
-  recv_active_.store(false, std::memory_order_release);
-  
-  // Clean up all pending requests
-  std::vector<std::shared_ptr<pending_request>> pending_list;
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    for (auto& [tid, req] : pending_requests_) {
-      pending_list.push_back(req);
-    }
-    pending_requests_.clear();
-  }
-  
-  // Mark all pending requests as failed and wake them up
-  for (auto& req : pending_list) {
-    req->error_code = errc::make_error_code(errc::error_code::request_failed);
-    req->completed.store(true, std::memory_order_release);
-    // ⭐ Wake up waiting coroutines
-    req->wakeup_signal->cancel();
-  }
-  
-  if (!pending_list.empty()) {
-    common::log.debug("Multiplexing upstream closed, canceled %zu pending requests",
-                      pending_list.size());
-  }
-  
-  // Call subclass protocol_close()
+
+  // Call subclass protocol_close() first to:
+  // 1. Disconnect IO connection, which will cause recv_loop's read_some() to return immediately
+  // 2. Release recv_mutex_ lock (recv_loop exits)
+  // 3. Invalidate session_ so any in-flight protocol_send() will fail gracefully
   co_await protocol_close();
+
+  // Now acquire both locks to ensure send_request Part 1 and recv_loop are not executing
+  // This ensures active_ is set atomically with respect to both send and recv operations
+  {
+    async_mutex_lock recv_lock(recv_mutex_);
+    co_await recv_lock.get_lock();  // Wait for recv_loop to exit (should be immediate)
+    
+    async_mutex_lock send_lock(send_mutex_);
+    co_await send_lock.get_lock();  // Wait for any send_request Part 1 to complete
+    
+    // Set active_ to false atomically (both locks held)
+    active_.store(false, std::memory_order_release);
+  }
+  
+  // Clear all pending requests and notify them
+  clear_all_pending_requests();
   
   common::log.info("Multiplexing upstream closed");
   co_return;
 }
 
 asio::awaitable<bool> dns_multiplexing_upstream::is_open() {
-  co_return co_await protocol_is_open();
+  co_return active_.load(std::memory_order_acquire);
 }
 
 asio::awaitable<bool> dns_multiplexing_upstream::send_request(
-    const char *data, uint16_t data_length, handle_response handler) {
+    dns::dns_object *dns_object) {
   
-  // Read original TID from buffer
-  uint16_t original_tid = (static_cast<uint8_t>(data[0]) << 8) |
-                          static_cast<uint8_t>(data[1]);
+  // Extract info from dns_object
+  char *data = dns_object->buffer_;
+  uint16_t data_length = static_cast<uint16_t>(dns_object->buffer_length_);
+  uint16_t original_tid = dns_object->question_id_;
+  uint16_t multiplex_tid = dns_object->transaction_id_;
   
-  if (!recv_active_.load(std::memory_order_acquire)) {
-    common::log.warning("Multiplexing send_request called but recv_loop not active");
-    co_await execute_handler(handler, errc::error_code::request_failed);
-    co_return false;
-  }
-  
-  // Error tracking (for use outside catch block, where co_await is permitted)
-  bool has_exception = false;
-  std::string exception_msg;
-  
-  // 1. Allocate multiplexing TID
-  uint16_t multiplex_tid = allocate_transaction_id();
-  
-  // 2. Modify TID in-place (no copy needed!)
-  char *mutable_data = const_cast<char*>(data);
-  mutable_data[0] = static_cast<char>(multiplex_tid >> 8);
-  mutable_data[1] = static_cast<char>(multiplex_tid & 0xFF);
-  
-  // 3. Create pending request (using caller's buffer for response)
-  auto req = std::make_shared<pending_request>(executor_, multiplex_tid, mutable_data);
-  req->original_tid = original_tid;
-  req->handler = handler;
-  
-  // 4. Register to pending map
+  // ========================================
+  // Part 1: Send preparation and transmission (with send_mutex_ lock)
+  // ========================================
   {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    pending_requests_[multiplex_tid] = req;
+    async_mutex_lock lock(send_mutex_);
+    co_await lock.get_lock();
     
-    size_t pending_size = pending_requests_.size();
-    if (pending_size > 50) {
-      common::log.warning("High pending count: %zu", pending_size);
+    // Validate active_ while holding lock
+    if (!active_.load(std::memory_order_acquire)) {
+      common::log.warning("Multiplexing send_request called but recv_loop not active");
+      co_return false;
     }
-  }
-  
-  // 5. Send request and wait for response
-  // Note: No internal timeout - rely on external timeout (dns_gateway layer)
-  // If timeout occurs, dns_gateway will call close() which will wake up all waiting requests
+    
+    // 1. Modify TID in-place using pre-assigned multiplex_tid
+    char *mutable_data = const_cast<char*>(data);
+    mutable_data[0] = static_cast<char>(multiplex_tid >> 8);
+    mutable_data[1] = static_cast<char>(multiplex_tid & 0xFF);
+    
+    // 2. Add to pending map (object already initialized in get_object())
+    add_pending_request(multiplex_tid, dns_object);
+    
+    // 3. Send request
     last_request_time_ = asio::steady_timer::clock_type::now();
-  
-  bool success = false;
-  
-  try {
-    // Send request (using modified buffer in-place)
-    int length = co_await protocol_send(mutable_data, data_length);
-
-    if (length != data_length) {
-      common::log.warning("Send failed: multiplex_tid=0x%04X, sent=%d, expected=%d",
-                          multiplex_tid, length, data_length);
-      has_exception = true;
-      exception_msg = "Send incomplete";
-    } else {
+    
+    try {
+      int length = co_await protocol_send(mutable_data, data_length);
+      
+      if (length != data_length) {
+        common::log.warning("Send failed: multiplex_tid=0x%04X, sent=%d, expected=%d",
+                            multiplex_tid, length, data_length);
+        co_return false;
+      }
+      
       common::log.debug("Multiplexing send: original_tid=0x%04X -> multiplex_tid=0x%04X",
                         original_tid, multiplex_tid);
-      
-      // Wait for response (indefinitely, until response arrives or close() is called)
-      success = co_await wait_for_response(req);
+    } catch (const std::exception &e) {
+      common::log.warning("send_request exception: %s", e.what());
+      co_return false;
     }
-  } catch (const std::exception &e) {
-    has_exception = true;
-    exception_msg = e.what();
+    
+    // Lock released here (end of scope)
   }
   
-  // Cleanup pending request
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    auto it = pending_requests_.find(multiplex_tid);
-    if (it != pending_requests_.end()) {
-      pending_requests_.erase(it);
-    }
-  }
-  
-  // Handle errors
-  if (has_exception) {
-    common::log.warning("send_request exception: %s", exception_msg.c_str());
-      co_await execute_handler(handler, errc::error_code::request_failed);
-    co_return false;
-  }
+  // ========================================
+  // Part 2: Wait for response (without lock)
+  // ========================================
+  // Note: No internal timeout - rely on external timeout (dns_gateway layer)
+  // If timeout occurs, dns_gateway will call close() which will wake up all waiting requests
+  bool success = co_await wait_for_response(dns_object);
   
   if (!success) {
     common::log.debug("Request failed or closed: multiplex_tid=0x%04X", multiplex_tid);
-    co_await execute_handler(handler, errc::error_code::request_failed);
     co_return false;
   }
   
-      co_return true;
-    }
+  co_return true;
+}
 
 asio::awaitable<void> dns_multiplexing_upstream::recv_loop() {
-  char recv_buffer[dns::buffer_size];
-  
   common::log.debug("Multiplexing recv_loop started");
   
-  while (recv_active_.load(std::memory_order_acquire)) {
+  while (active_.load(std::memory_order_acquire)) {
+    async_mutex_lock lock(recv_mutex_);
+    co_await lock.get_lock();
+
+    if (!active_.load(std::memory_order_acquire))
+        break;
+
     try {
-      // Receive data from protocol layer
-      int length = co_await protocol_recv(recv_buffer, sizeof(recv_buffer));
-      
-      // Check for error or connection closed
-      if (length < 0) {
-        common::log.warning("protocol_recv returned error (%d), exiting recv_loop", length);
-        break;  // Exit loop on error
+      // Call protocol_recv which will receive one packet and call handle_recv()
+      // Returns false to stop the loop (connection closed or error)
+      bool should_continue = co_await protocol_recv();
+      if (!should_continue) {
+        common::log.debug("protocol_recv returned false, stopping recv_loop");
+        break;
       }
-      
-      if (length < 12) {
-        common::log.debug("Received invalid packet, size=%d", length);
-        continue;
-      }
-      
-      // Parse multiplexing TID (DNS header first 2 bytes)
-      uint16_t multiplex_tid = (static_cast<uint8_t>(recv_buffer[0]) << 8) |
-                               static_cast<uint8_t>(recv_buffer[1]);
-      
-      // Find corresponding pending request
-      std::shared_ptr<pending_request> req;
-      {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        auto it = pending_requests_.find(multiplex_tid);
-        if (it != pending_requests_.end()) {
-          req = it->second;
-          pending_requests_.erase(it);
-        }
-      }
-      
-      if (req) {
-        // ⭐ KEY: Restore original TID to response buffer
-        recv_buffer[0] = static_cast<char>(req->original_tid >> 8);
-        recv_buffer[1] = static_cast<char>(req->original_tid & 0xFF);
-        
-        // Copy to response buffer
-        req->response_length = length;
-        std::memcpy(req->response_buffer, recv_buffer, length);
-        req->completed.store(true, std::memory_order_release);
-        
-        // ⭐ Wake up the waiting coroutine by canceling its wakeup signal
-        req->wakeup_signal->cancel();
-        
-        common::log.debug("Multiplexing recv: multiplex_tid=0x%04X -> restored original_tid=0x%04X",
-                          multiplex_tid, req->original_tid);
-        
-        // Execute handler with restored TID
-        co_await execute_handler(req->handler, 
-                                 errc::error_code::no_error,
-                                 req->response_buffer, 
-                                 req->response_length);
-      } else {
-        common::log.debug("Unmatched response: multiplex_tid=0x%04X (timeout or canceled)",
-                          multiplex_tid);
-      }
-      
     } catch (const std::exception &e) {
-      if (recv_active_.load(std::memory_order_acquire)) {
-        common::log.warning("recv_loop exception: %s", e.what());
-      }
+      common::log.warning("recv_loop exception: %s", e.what());
+      // Connection error occurred, exit loop to cleanup
+      // The connection is no longer usable, break to clean up and notify pending requests
       break;
     }
   }
-  
+
+  clear_all_pending_requests();
   common::log.debug("Multiplexing recv_loop terminated");
 }
 
-asio::awaitable<bool> dns_multiplexing_upstream::wait_for_response(
-    std::shared_ptr<pending_request> req) {
+// Handle received data (called by subclasses when data is ready)
+void dns_multiplexing_upstream::handle_recv(const char *buffer, size_t length, uint16_t multiplex_tid) {
+  // Find corresponding pending request
+  dns::dns_object *obj = get_pending_request(multiplex_tid);
   
-  try {
-    // ⭐ Wait indefinitely for wakeup signal (no timeout!)
-    // The wakeup_signal will be canceled when:
-    // 1. Response arrives (by recv_loop)
-    // 2. close() is called (by external timeout or shutdown)
-    co_await req->wakeup_signal->async_wait(asio::use_awaitable);
-  } catch (const std::system_error &e) {
-    // Timer was canceled - this is the normal wakeup path
+  if (!obj) {
+    common::log.debug("Unmatched response: multiplex_tid=0x%04X (timeout or canceled)",
+                      multiplex_tid);
+    return;
+  }
+
+  // Check buffer length
+  if (length < 12) {
+    common::log.debug("Received invalid packet, size=%zu", length);
+    return;
+  }
+
+  // Check buffer size limit
+  if (length > dns::buffer_size) {
+    common::log.error("Response too large: %zu bytes (max %d)", length, dns::buffer_size);
+    length = dns::buffer_size;
+  }
+
+  // Remove object from pending
+  remove_pending_request(multiplex_tid);
+
+  // Copy data to obj->buffer_ (single copy, all happens here)
+  memcpy(obj->buffer_, buffer, length);
+  obj->buffer_length_ = static_cast<int>(length);
+
+  // ⭐ KEY: Restore original TID to obj->buffer_ (overwrite multiplex_tid in first 2 bytes)
+  obj->buffer_[0] = static_cast<char>(obj->question_id_ >> 8);
+  obj->buffer_[1] = static_cast<char>(obj->question_id_ & 0xFF);
+  
+  obj->completed_.store(true, std::memory_order_release);
+  
+  // ⭐ Wake up the waiting coroutine by notifying the event
+  if (obj->wakeup_signal_) {
+    obj->wakeup_signal_->notify();
   }
   
+  common::log.debug("Multiplexing recv: multiplex_tid=0x%04X -> restored original_tid=0x%04X",
+                    multiplex_tid, obj->question_id_);
+}
+
+asio::awaitable<bool> dns_multiplexing_upstream::wait_for_response(
+    dns::dns_object *obj) {
+  
+  // ⭐ Wait indefinitely for wakeup signal (no timeout!)
+  // The wakeup_signal will be notified when:
+  // 1. Response arrives (by recv_loop)
+  // 2. close() is called (by external timeout or shutdown)
+  co_await obj->wakeup_signal_->wait();
+  
   // Check if completed successfully
-  if (req->completed.load(std::memory_order_acquire) && req->response_length > 0) {
+  if (obj->completed_.load(std::memory_order_acquire) && obj->buffer_length_ > 0) {
     co_return true;
   }
 
   co_return false;
 }
 
-uint16_t dns_multiplexing_upstream::allocate_transaction_id() {
-  uint16_t tid = next_transaction_id_.fetch_add(1, std::memory_order_relaxed);
-  
-  // Skip 0 as it's not a valid transaction ID
-  if (tid == 0) {
-    tid = next_transaction_id_.fetch_add(1, std::memory_order_relaxed);
-  }
-  
-  // Check for collision (rare but possible in high concurrency)
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    int collision_count = 0;
-    while (pending_requests_.count(tid) && collision_count < 100) {
-      tid = next_transaction_id_.fetch_add(1, std::memory_order_relaxed);
-      if (tid == 0) {
-        tid = next_transaction_id_.fetch_add(1, std::memory_order_relaxed);
-      }
-      collision_count++;
-    }
-    
-    if (collision_count > 0) {
-      common::log.debug("TID collision detected, retried %d times", collision_count);
-    }
-  }
-  
-  return tid;
-}
+// allocate_transaction_id moved to dns_gateway
 
 size_t dns_multiplexing_upstream::get_pending_count() const {
   std::lock_guard<std::mutex> lock(pending_mutex_);
   return pending_requests_.size();
+}
+
+// Pending requests management methods
+void dns_multiplexing_upstream::add_pending_request(uint16_t multiplex_tid, dns::dns_object *dns_object) {
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  pending_requests_[multiplex_tid] = dns_object;
+  
+  size_t pending_size = pending_requests_.size();
+  if (pending_size > 50) {
+    common::log.warning("High pending count: %zu", pending_size);
+  }
+}
+
+dns::dns_object* dns_multiplexing_upstream::remove_pending_request(uint16_t multiplex_tid) {
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  auto it = pending_requests_.find(multiplex_tid);
+  if (it != pending_requests_.end()) {
+    dns::dns_object* obj = it->second;
+    pending_requests_.erase(it);
+    return obj;
+  }
+  return nullptr;
+}
+
+dns::dns_object* dns_multiplexing_upstream::get_pending_request(uint16_t multiplex_tid) const {
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  auto it = pending_requests_.find(multiplex_tid);
+  if (it != pending_requests_.end()) {
+    return it->second;
+  }
+  return nullptr;
+}
+
+void dns_multiplexing_upstream::clear_all_pending_requests() {
+  // Collect all pending requests while holding the lock
+  std::vector<dns::dns_object*> pending_list;
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    for (auto &entry : pending_requests_) {
+      pending_list.push_back(entry.second);
+    }
+    // Clear the map
+    pending_requests_.clear();
+  }
+
+  // Notify all pending requests with error (without holding the lock)
+  // Use try-catch to prevent crashes if notification fails
+  for (auto *obj : pending_list) {
+    if (obj) {
+      try {
+        obj->error_code_ = errc::make_error_code(errc::error_code::request_failed);
+        obj->completed_.store(true, std::memory_order_release);
+        if (obj->wakeup_signal_) {
+          obj->wakeup_signal_->notify();
+        }
+      } catch (const std::exception &e) {
+        common::log.error("Exception when clearing pending request: %s", e.what());
+        // Continue with next request
+      } catch (...) {
+        common::log.error("Unknown exception when clearing pending request");
+        // Continue with next request
+      }
+    }
+  }
+  
+  common::log.debug("Cleared %zu pending requests", pending_list.size());
 }
 
 // ========================================
@@ -505,14 +555,32 @@ asio::awaitable<int> dns_udp_upstream::protocol_send(const char *data, size_t le
   co_return sent;
 }
 
-asio::awaitable<int> dns_udp_upstream::protocol_recv(char *buffer, size_t buffer_size) {
-  int received = co_await client_.recv(buffer, buffer_size);
+asio::awaitable<bool> dns_udp_upstream::protocol_recv() {
+  char buffer[dns::buffer_size];
+  
+  if (!client_.is_associated()) {
+    co_return false;
+  }
+  
+  int received = co_await client_.recv(buffer, sizeof(buffer));
   
   if (received < 0) {
     common::log.warning("UDP %s:%d - recv failed: %d", host_.c_str(), port_, received);
+    co_return false;
   }
   
-  co_return received;
+  if (received < 12) {
+    common::log.debug("UDP %s:%d - Received invalid packet, size=%d", host_.c_str(), port_, received);
+    co_return true;  // Continue receiving
+  }
+  
+  // Parse multiplexing TID (DNS header first 2 bytes)
+  uint16_t multiplex_tid = (static_cast<uint8_t>(buffer[0]) << 8) |
+                           static_cast<uint8_t>(buffer[1]);
+  
+  // Call handle_recv to copy data and process the response
+  handle_recv(buffer, received, multiplex_tid);
+  co_return true;  // Continue receiving
 }
 
 dns_tls_upstream::dns_tls_upstream(asio::any_io_executor executor,
@@ -532,44 +600,6 @@ dns_tls_upstream::~dns_tls_upstream() {
   }
 }
 
-asio::awaitable<bool> dns_tls_upstream::check() {
-  // Validation check: send a test DNS query to verify connection is working
-  // This prevents servers from closing idle connections or treating as attack
-  try {
-    // Use configured check domain or auto-detect based on provider
-    std::string check_domain = get_next_check_domain();
-    
-    dns_package package;
-    package.add_question(check_domain.c_str(), dns::anwser_type::a);
-    
-    char validation_buffer[dns::buffer_size];
-    int length = package.dump(validation_buffer, sizeof(validation_buffer));
-    
-    if (length > 0) {
-      bool validation_passed = false;
-      
-      auto validation_handler = [&](std::error_code ec, const char *data,
-                                     uint16_t data_length) -> asio::awaitable<void> {
-        if (!ec && data_length > 0) {
-          validation_passed = true;
-        }
-        co_return;
-      };
-      
-      // Send validation request
-      bool send_result = co_await send_request(validation_buffer, length, validation_handler);
-      
-      if (send_result && validation_passed) {
-        co_return true;
-      }
-    }
-  } catch (const std::exception &e) {
-    common::log.debug("TLS/HTTPS %s:%d - health check exception: %s",
-                      host_.c_str(), port_, e.what());
-  }
-  
-  co_return false;
-}
 
 asio::awaitable<bool> dns_tls_upstream::open() {
   if (client_ == nullptr) {
@@ -582,19 +612,20 @@ asio::awaitable<bool> dns_tls_upstream::open() {
     co_return false;
   }
   
-  // Immediately validate the connection after establishing
-  bool check_result = co_await check();
-  
-  if (check_result) {
-    common::log.debug("TLS/HTTPS upstream %s:%d opened and validated",
-                      host_.c_str(), port_);
-    co_return true;
-  } else {
-    common::log.warning("TLS/HTTPS connection validation failed for %s:%d, closing",
-                        host_.c_str(), port_);
-    disconnect();
-    co_return false;
+  // Perform health check if enabled (handled by base class for multiplexing, here for TLS/HTTPS)
+  if (check_enabled()) {
+    bool check_result = co_await check();
+    if (!check_result) {
+      common::log.warning("TLS/HTTPS connection validation failed for %s:%d, closing",
+                          host_.c_str(), port_);
+      disconnect();
+      co_return false;
+    }
   }
+  
+  common::log.debug("TLS/HTTPS upstream %s:%d opened",
+                    host_.c_str(), port_);
+  co_return true;
 }
 
 asio::awaitable<void> dns_tls_upstream::close() {
@@ -609,16 +640,14 @@ asio::awaitable<bool> dns_tls_upstream::is_open() {
   co_return is_connected();
 }
 
-asio::awaitable<bool> dns_tls_upstream::send_request(const char *data,
-                                                     uint16_t data_length,
-                                                     handle_response handler) {
+asio::awaitable<bool> dns_tls_upstream::send_request(dns::dns_object *dns_object) {
   try {
     // send dns request
     last_request_time_ = asio::steady_timer::clock_type::now();
 
     dns_buffer request_buffer((uint8_t *)buffer_, sizeof(buffer_));
-    request_buffer.write_16bits(data_length);
-    request_buffer.write_buffer(data, data_length);
+    request_buffer.write_16bits(static_cast<uint16_t>(dns_object->buffer_length_));
+    request_buffer.write_buffer(dns_object->buffer_, dns_object->buffer_length_);
 
     common::log.debug("TLS %s:%d - sending request, size=%d bytes", 
                       host_.c_str(), port_, request_buffer.size());
@@ -642,8 +671,9 @@ asio::awaitable<bool> dns_tls_upstream::send_request(const char *data,
       common::log.debug("TLS %s:%d - response parsed, dns_length=%d bytes", 
                         host_.c_str(), port_, response_length);
 
-      co_await execute_handler(handler, errc::error_code::no_error,
-                               response_buffer.data() + 2, response_length);
+      // Copy response back into dns_object buffer
+      std::memcpy(dns_object->buffer_, response_buffer.data() + 2, response_length);
+      dns_object->buffer_length_ = response_length;
       co_return true;
     } else {
       common::log.warning("TLS %s:%d - empty response received", 
@@ -734,8 +764,7 @@ char *dns_https_upstream::search_substring(char *buffer,
 }
 
 asio::awaitable<bool>
-dns_https_upstream::send_request(const char *data, uint16_t data_length,
-                                 handle_response handler) {
+dns_https_upstream::send_request(dns::dns_object *dns_object) {
   try {
     // send dns request
     last_request_time_ = asio::steady_timer::clock_type::now();
@@ -752,16 +781,16 @@ dns_https_upstream::send_request(const char *data, uint16_t data_length,
       request_string += "Connection: close\r\n";
     }
 
-    request_string += "Content-Length: " + std::to_string(data_length) + "\r\n";
+    request_string += "Content-Length: " + std::to_string(dns_object->buffer_length_) + "\r\n";
     request_string += "\r\n";
 
     uint16_t request_length = (uint16_t)request_string.length();
     std::copy(request_string.begin(), request_string.end(), buffer_);
-    std::copy(data, data + data_length, buffer_ + request_length);
-    request_length += data_length;
+    std::copy(dns_object->buffer_, dns_object->buffer_ + dns_object->buffer_length_, buffer_ + request_length);
+    request_length += dns_object->buffer_length_;
 
     common::log.debug("DoH %s:%d - sending HTTP request, total=%d bytes (header=%d, body=%d)", 
-                      host_.c_str(), port_, request_length, request_string.length(), data_length);
+                      host_.c_str(), port_, request_length, request_string.length(), dns_object->buffer_length_);
     co_await client_->write(buffer_, request_length);
     common::log.debug("DoH %s:%d - HTTP request sent, waiting for response", 
                       host_.c_str(), port_);
@@ -814,19 +843,17 @@ dns_https_upstream::send_request(const char *data, uint16_t data_length,
                               host_.c_str(), port_);
           }
 
-          co_await execute_handler(handler, errc::error_code::no_error,
-                                   header_end, data_length);
+          // Copy body into dns_object buffer
+          std::memcpy(dns_object->buffer_, header_end, data_length);
+          dns_object->buffer_length_ = data_length;
           co_return true;
         } else {
           common::log.warning("DoH %s:%d - data length mismatch: expected=%d, received=%d",
                               host_.c_str(), port_, header.content_length, data_length);
-          co_await execute_handler(handler, errc::error_code::http_data_error);
         }
       } else {
         common::log.warning("DoH %s:%d - invalid HTTP response: status=%d, content_type=%s",
                             host_.c_str(), port_, header.status_code, header.content_type.c_str());
-        co_await execute_handler(handler,
-                                 errc::error_code::http_header_invalid);
       }
     } else {
       common::log.warning("DoH %s:%d - no HTTP header terminator found in %d bytes",
@@ -973,14 +1000,28 @@ void dns_http2_upstream::create_client() {
 }
 
 dns_http2_upstream::~dns_http2_upstream() {
+  // Cleanup session first (don't try to send anything in destructor)
   if (session_) {
     nghttp2_session_del(session_);
     session_ = nullptr;
   }
+  
+  // Disconnect client (safe to call even if already disconnected)
+  if (client_) {
+    try {
+      client_->disconnect();
+    } catch (const std::exception &e) {
+      // Ignore errors in destructor
+    }
+    client_.reset();  // Release shared_ptr
+  }
+  
+  // Cleanup SSL context
   if (ssl_context_) {
     delete ssl_context_;
     ssl_context_ = nullptr;
   }
+  
   common::log.info("HTTP/2 upstream destroyed: %s:%d", host_.c_str(), port_);
 }
 
@@ -1098,36 +1139,46 @@ asio::awaitable<bool> dns_http2_upstream::protocol_open() {
 
 asio::awaitable<void> dns_http2_upstream::protocol_close() {
   common::log.warning("HTTP/2 %s:%d - protocol_close() called", host_.c_str(), port_);
-  try {
-    if (session_) {
+  
+  // First, cleanup session (may try to send GOAWAY)
+  if (session_) {
+    try {
       nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
-      bool status = co_await send_session_data();
-      if (!status) {
-        common::log.warning("HTTP/2 %s:%d - Failed to send GOAWAY frame (non-critical)",
-                           host_.c_str(), port_);
+      // Try to send GOAWAY frame, but ignore failures (connection may already be closed)
+      try {
+        if (client_ && client_->is_connected()) {
+          co_await send_session_data();
+        }
+      } catch (const std::exception &e) {
+        // Ignore send errors during close
+        common::log.debug("HTTP/2 %s:%d - Failed to send GOAWAY frame: %s (ignored)",
+                         host_.c_str(), port_, e.what());
       }
-      
-      nghttp2_session_del(session_);
-      session_ = nullptr;
+    } catch (const std::exception &e) {
+      common::log.warning("HTTP/2 %s:%d - Error terminating session: %s",
+                         host_.c_str(), port_, e.what());
     }
     
-    if (client_) {
-      client_->disconnect();
-    }
-    
-    // Clean up response queue
-    while (!response_ready_queue_.empty()) {
-      response_ready_queue_.pop();
-    }
-    
-    common::log.info("HTTP/2 %s:%d - Connection closed", host_.c_str(), port_);
-  } catch (const std::exception &e) {
-    common::log.warning("HTTP/2 %s:%d - Close error: %s",
-                       host_.c_str(), port_, e.what());
+    nghttp2_session_del(session_);
+    session_ = nullptr;
   }
   
+  // Then disconnect client (safe even if already disconnected)
+  if (client_) {
+    try {
+      client_->disconnect();
+    } catch (const std::exception &e) {
+      common::log.debug("HTTP/2 %s:%d - Error during client disconnect: %s (ignored)",
+                       host_.c_str(), port_, e.what());
+    }
+  }
+  
+  // No queue cleanup needed - callback directly calls handle_recv()
+  
+  common::log.info("HTTP/2 %s:%d - Connection closed", host_.c_str(), port_);
   co_return;
 }
+
 
 asio::awaitable<bool> dns_http2_upstream::protocol_is_open() {
   co_return (client_ && client_->is_connected() && session_);
@@ -1222,73 +1273,38 @@ asio::awaitable<int> dns_http2_upstream::protocol_send(const char *data, size_t 
   }
 }
 
-asio::awaitable<int> dns_http2_upstream::protocol_recv(char *buffer, size_t buffer_size) {
-  
+asio::awaitable<bool> dns_http2_upstream::protocol_recv() {
   if (!session_ || !client_) {
     common::log.error("HTTP/2 %s:%d - protocol_recv: session or client is null", 
                      host_.c_str(), port_);
-    co_return -1;
+    co_return false;
   }
   
-  try {
-    // Loop: read and process frames until we get a complete response
-    while (true) {
-      // Check if queue has any ready responses
-      uint16_t ready_tid = 0;
-      if (!response_ready_queue_.empty()) {
-        ready_tid = response_ready_queue_.front();
-        response_ready_queue_.pop();
-      }
-      
-      // If we got a ready TID, fetch the data from pending_request
-      if (ready_tid != 0) {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        auto it = pending_requests_.find(ready_tid);
-        if (it != pending_requests_.end()) {
-          auto& req = it->second;
-          
-          size_t copy_len = std::min(static_cast<size_t>(req->response_length), buffer_size);
-          memcpy(buffer, req->response_buffer, copy_len);
-          
-          int result = req->response_length;
-          
-          // common::log.debug("HTTP/2 %s:%d - Returning response for TID=%u, length=%d",
-          //                 host_.c_str(), port_, ready_tid, result);
-          
-          co_return result;
-        } else {
-          common::log.warning("HTTP/2 %s:%d - Ready TID=%u not found in pending_requests",
-                            host_.c_str(), port_, ready_tid);
-          // Continue to read more data
-        }
-      }
-      
-      // No ready response, continue reading and processing frames
-      char read_buf[8192];
-      auto bytes = co_await client_->read_some(read_buf, sizeof(read_buf));
-      
-      if (bytes <= 0) {
-        common::log.warning("HTTP/2 %s:%d - Connection closed (read returned %d)",
-                          host_.c_str(), port_, bytes);
-        co_return -1;
-      }
-      
-      // Feed data to nghttp2 (will trigger callbacks that may push to queue)
-      ssize_t rv = nghttp2_session_mem_recv(session_, (const uint8_t *)read_buf, bytes);
-      if (rv < 0) {
-        common::log.error("HTTP/2 %s:%d - mem_recv failed: %s",
-                         host_.c_str(), port_, nghttp2_strerror((int)rv));
-        co_return -1;
-      }
-      
-      // Loop back to check if callback filled any response
-    }
-    
-  } catch (const std::exception &e) {
-    common::log.error("HTTP/2 %s:%d - Recv failed: %s",
-                     host_.c_str(), port_, e.what());
-    co_return -1;
+  if (!client_->is_connected()) {
+    common::log.debug("HTTP/2 %s:%d - Connection closed", host_.c_str(), port_);
+    co_return false;
   }
+  
+  // Read and process one HTTP/2 frame
+  // Callbacks will call handle_recv() when data is ready
+  char read_buf[8192];
+  auto bytes = co_await client_->read_some(read_buf, sizeof(read_buf));
+  
+  if (bytes <= 0) {
+    common::log.warning("HTTP/2 %s:%d - Connection closed (read returned %d)",
+                     host_.c_str(), port_, bytes);
+    co_return false;
+  }
+  
+  // Feed data to nghttp2 (will trigger callbacks that copy to pending_request and call handle_recv)
+  ssize_t rv = nghttp2_session_mem_recv(session_, (const uint8_t *)read_buf, bytes);
+  if (rv < 0) {
+    common::log.error("HTTP/2 %s:%d - mem_recv failed: %s",
+                     host_.c_str(), port_, nghttp2_strerror((int)rv));
+    co_return false;
+  }
+  
+  co_return true;  // Continue receiving
 }
 
 // Helper: Send pending session data
@@ -1297,30 +1313,44 @@ asio::awaitable<bool> dns_http2_upstream::send_session_data() {
     co_return false;
   }
   
-  int chunk_count = 0;
-  while (true) {
-    const uint8_t *data;
-    ssize_t datalen = nghttp2_session_mem_send(session_, &data);
-    
-    if (datalen < 0) {
-      common::log.error("HTTP/2 %s:%d - mem_send failed: %s",
-                       host_.c_str(), port_, nghttp2_strerror((int)datalen));
-      co_return false;
-    }
-    
-    if (datalen == 0) {
-      break;
-    }
-    
-    chunk_count++;
-    int written = co_await client_->write(reinterpret_cast<const char*>(data), datalen);
-    if (written != datalen) {
-      common::log.error("HTTP/2 %s:%d - Write incomplete: %d/%zu bytes", 
-                       host_.c_str(), port_, written, datalen);
-      co_return false;
-    }
+  // Check if client is still connected
+  if (!client_->is_connected()) {
+    co_return false;
   }
-  co_return true;
+  
+  try {
+    while (true) {
+      const uint8_t *data;
+      ssize_t datalen = nghttp2_session_mem_send(session_, &data);
+      
+      if (datalen < 0) {
+        common::log.error("HTTP/2 %s:%d - mem_send failed: %s",
+                         host_.c_str(), port_, nghttp2_strerror((int)datalen));
+        co_return false;
+      }
+      
+      if (datalen == 0) {
+        break;
+      }
+      
+      // Check connection before write
+      if (!client_->is_connected()) {
+        co_return false;
+      }
+      
+      int written = co_await client_->write(reinterpret_cast<const char*>(data), datalen);
+      if (written != datalen) {
+        common::log.error("HTTP/2 %s:%d - Write incomplete: %d/%zu bytes", 
+                         host_.c_str(), port_, written, datalen);
+        co_return false;
+      }
+    }
+    co_return true;
+  } catch (const std::exception &e) {
+    common::log.warning("HTTP/2 %s:%d - send_session_data exception: %s",
+                       host_.c_str(), port_, e.what());
+    co_return false;
+  }
 }
 
 // nghttp2 callbacks
@@ -1354,46 +1384,44 @@ int dns_http2_upstream::on_data_chunk_recv_callback(nghttp2_session *session,
                                                     void *user_data) {
   auto *self = static_cast<dns_http2_upstream *>(user_data);
   
-  // 1. Get multiplex_tid from stream_user_data (no mapping table needed!)
+  // Get multiplex_tid from stream_user_data
   void *stream_user_data = nghttp2_session_get_stream_user_data(session, stream_id);
   if (!stream_user_data) {
     common::log.warning("HTTP/2 - Received data for stream without user_data: stream_id=%d", stream_id);
-    return 0;
+    return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   uint16_t multiplex_tid = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(stream_user_data));
   
-  // 2. Find pending_request and fill response buffer directly
-  {
-    std::lock_guard<std::mutex> lock(self->pending_mutex_);
-    auto it = self->pending_requests_.find(multiplex_tid);
-    if (it == self->pending_requests_.end()) {
-      common::log.warning("HTTP/2 - Received data for unknown multiplex_tid=%u (stream_id=%d)",
-                         multiplex_tid, stream_id);
-      return 0;
-    }
-    
-    auto& req = it->second;
-    
-    // Check buffer size
-    if (len > dns::buffer_size) {
-      common::log.error("HTTP/2 - Response too large: %zu bytes (max %d)",
-                       len, dns::buffer_size);
-      len = dns::buffer_size;
-    }
-    
-    // Copy data directly to pending_request's response_buffer
-    memcpy(req->response_buffer, data, len);
-    
-    // Keep multiplex_tid in response buffer (recv_loop will restore original_tid)
-    req->response_buffer[0] = static_cast<char>(multiplex_tid >> 8);
-    req->response_buffer[1] = static_cast<char>(multiplex_tid & 0xFF);
-    
-    // Set response_length
-    req->response_length = static_cast<size_t>(len);
+  // Check if multiplex_tid exists (handle_recv will check again, but early check is good)
+  dns::dns_object* obj = self->get_pending_request(multiplex_tid);
+  if (!obj) {
+    common::log.warning("HTTP/2 - Received data for unknown multiplex_tid=%u (stream_id=%d)",
+                       multiplex_tid, stream_id);
+    return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   
-  // 3. Push multiplex_tid to ready queue
-  self->response_ready_queue_.push(multiplex_tid);  
+  // Call handle_recv to copy data and process the response
+  // Note: nghttp2 data contains complete DNS packet including TID (multiplex_tid)
+  // But we need to verify the TID matches, or we could just use the data directly
+  // However, to be safe and consistent, we'll use multiplex_tid we already know
+  if (len > dns::buffer_size) {
+    common::log.error("HTTP/2 - Response too large: %zu bytes (max %d)",
+                     len, dns::buffer_size);
+    len = dns::buffer_size;
+  }
+  
+  // nghttp2 data should already contain the complete DNS packet with TID
+  // But to ensure consistency, we verify/correct the TID in first 2 bytes
+  char temp_buffer[dns::buffer_size];
+  memcpy(temp_buffer, data, len);
+  
+  // Ensure first 2 bytes contain multiplex_tid (should already match, but be explicit)
+  temp_buffer[0] = static_cast<char>(multiplex_tid >> 8);
+  temp_buffer[1] = static_cast<char>(multiplex_tid & 0xFF);
+  
+  // Call handle_recv with complete buffer
+  self->handle_recv(temp_buffer, len, multiplex_tid);
+  
   return 0;
 }
 

@@ -17,7 +17,7 @@
 
 namespace dns {
 dns_statics::dns_statics(asio::any_io_executor executor)
-    : executor_(executor) {}
+    : executor_(executor), mutex_(executor) {}
 
 void dns_statics::add_static_value(const std::string &domain,
                                    dns::anwser_type type,

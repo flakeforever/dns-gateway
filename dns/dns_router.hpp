@@ -75,6 +75,6 @@ private:
   uint8_t next_group_id_ = 1;
 
   asio::any_io_executor executor_;
-  std::atomic_bool locked_ = false;
+  async_mutex mutex_;
 };
 } // namespace dns

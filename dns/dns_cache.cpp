@@ -40,7 +40,8 @@ uint32_t dns_cache_entry::get_ttl() {
 
 void dns_cache_entry::set_ttl(uint32_t value) { ttl_ = value; }
 
-dns_cache::dns_cache(asio::any_io_executor executor) : executor_(executor) {
+dns_cache::dns_cache(asio::any_io_executor executor) 
+    : executor_(executor), mutex_(executor) {
   last_update_time_ = dns::get_current_time();
 }
 

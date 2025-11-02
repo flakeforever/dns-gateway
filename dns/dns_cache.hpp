@@ -59,7 +59,7 @@ public:
   asio::awaitable<dns_cache_entry *> query_cache(const std::string &domain,
                                                  uint8_t type);
 
-  std::atomic_bool locked_ = false;
+  async_mutex mutex_;
 
 private:
   std::string generate_key(const std::string &domain, uint8_t type);

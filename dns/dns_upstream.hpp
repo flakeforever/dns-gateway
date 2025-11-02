@@ -17,6 +17,7 @@
 
 #include "dns_buffer.hpp"
 #include "dns_error.hpp"
+#include "dns_object.hpp"
 #include "operation.hpp"
 #include "property.hpp"
 #include <socks/socks_client.hpp>
@@ -72,7 +73,7 @@ public:
   virtual asio::awaitable<void> close();
   virtual asio::awaitable<bool> is_open();
   virtual asio::awaitable<bool>
-  send_request(const char *data, uint16_t data_length, handle_response handler);
+  send_request(dns::dns_object *dns_object);
   virtual asio::awaitable<bool> check();
   
   // Record request statistics
@@ -90,7 +91,7 @@ public:
   // UDP/multiplexing upstreams support it, TCP-based (DoT/DoH) does not
   virtual bool supports_multiplexing() const { return false; }
 
-  std::atomic_bool locked_ = false;
+  async_mutex mutex_;
 
 protected:
   asio::awaitable<void> execute_handler(handle_response handler,
@@ -128,15 +129,25 @@ public:
   asio::awaitable<void> close() override;
   asio::awaitable<bool> is_open() override;
   
-  // Send request using raw buffer
-  asio::awaitable<bool> send_request(const char *data, uint16_t data_length,
-                                     handle_response handler) override;
+  // Send request using dns_object
+  asio::awaitable<bool> send_request(dns::dns_object *dns_object) override;
   
   // Multiplexing upstreams support concurrent requests
   bool supports_multiplexing() const override { return true; }
   
   // Get pending request count (for monitoring)
   size_t get_pending_count() const;
+
+private:
+  // Pending requests management (thread-safe)
+  void add_pending_request(uint16_t multiplex_tid, dns::dns_object *dns_object);
+  dns::dns_object* remove_pending_request(uint16_t multiplex_tid);
+  // Clear all pending requests and notify them with error
+  void clear_all_pending_requests();
+
+protected:
+  // Get pending request (for subclasses to access in protocol_recv)
+  dns::dns_object* get_pending_request(uint16_t multiplex_tid) const;
 
 protected:
   // ========================================
@@ -156,38 +167,18 @@ protected:
   // Send raw data
   virtual asio::awaitable<int> protocol_send(const char *data, size_t length) = 0;
   
-  // Receive raw data
-  virtual asio::awaitable<int> protocol_recv(char *buffer, size_t buffer_size) = 0;
+  // Receive raw data (single operation, called by recv_loop in a loop)
+  // Subclasses should call handle_recv() when data is received
+  // Returns true to continue receiving, false to stop the recv_loop
+  virtual asio::awaitable<bool> protocol_recv() = 0;
+  
+  // Handle received data (called by subclasses when data is ready)
+  // Copies data to obj->buffer_ and processes the response
+  void handle_recv(const char *buffer, size_t length, uint16_t multiplex_tid);
   
   // ========================================
   // Protected members for derived classes
   // ========================================
-  
-  // Pending request structure
-  struct pending_request {
-    uint16_t transaction_id;      // Multiplexing TID
-    uint16_t original_tid;         // Original client TID
-    handle_response handler;
-    std::atomic<bool> completed{false};
-    char *response_buffer;         // ⭐ Pointer to external buffer (from dns_object)
-    size_t response_length{0};
-    std::error_code error_code;
-    std::shared_ptr<asio::steady_timer> wakeup_signal;  // Signal for waking up waiting coroutine
-    
-    pending_request(asio::any_io_executor exec, uint16_t tid, char *buffer)
-      : transaction_id(tid),
-        original_tid(0),
-        response_buffer(buffer),   // ⭐ Store pointer to external buffer
-        response_length(0),
-        wakeup_signal(std::make_shared<asio::steady_timer>(exec)) {
-      // Set to never expire (will be canceled to signal completion)
-      wakeup_signal->expires_at(asio::steady_timer::time_point::max());
-    }
-  };
-  
-  // Pending requests map (transaction_id -> pending_request)
-  std::unordered_map<uint16_t, std::shared_ptr<pending_request>> pending_requests_;
-  mutable std::mutex pending_mutex_;
 
 private:
   // ========================================
@@ -198,16 +189,19 @@ private:
   asio::awaitable<void> recv_loop();
   
   // Wait for specific request to complete (no internal timeout)
-  asio::awaitable<bool> wait_for_response(std::shared_ptr<pending_request> req);
+  asio::awaitable<bool> wait_for_response(dns::dns_object *obj);
   
-  // Allocate unique transaction ID
-  uint16_t allocate_transaction_id();
+  // Pending requests map (transaction_id -> dns_object*)
+  std::unordered_map<uint16_t, dns::dns_object*> pending_requests_;
+  mutable std::mutex pending_mutex_;
   
   // Receive loop control
-  std::atomic<bool> recv_active_{false};
+  std::atomic<bool> active_{false};
+  async_mutex recv_mutex_;
   
-  // Transaction ID allocator
-  std::atomic<uint16_t> next_transaction_id_{1};
+  // Send request synchronization
+  async_mutex send_mutex_;
+
 };
 
 class dns_udp_upstream : public dns_multiplexing_upstream {
@@ -221,7 +215,7 @@ protected:
   asio::awaitable<void> protocol_close() override;
   asio::awaitable<bool> protocol_is_open() override;
   asio::awaitable<int> protocol_send(const char *data, size_t length) override;
-  asio::awaitable<int> protocol_recv(char *buffer, size_t buffer_size) override;
+  asio::awaitable<bool> protocol_recv() override;
 
 private:
   socks::socks_udp_client client_;
@@ -244,10 +238,7 @@ public:
   virtual asio::awaitable<bool> open() override;
   virtual asio::awaitable<void> close() override;
   virtual asio::awaitable<bool> is_open() override;
-  virtual asio::awaitable<bool> send_request(const char *data,
-                                             uint16_t data_length,
-                                             handle_response handler) override;
-  virtual asio::awaitable<bool> check() override;
+  virtual asio::awaitable<bool> send_request(dns::dns_object *dns_object) override;
 
 protected:
   void create_client();
@@ -281,8 +272,7 @@ public:
   dns_https_upstream(asio::any_io_executor executor, std::string host,
                      uint16_t port, std::string path);
 
-  asio::awaitable<bool> send_request(const char *data, uint16_t data_length,
-                                     handle_response handler) override;
+  asio::awaitable<bool> send_request(dns::dns_object *dns_object) override;
 
 protected:
   http_header parse_http_header(const std::string &header_string);
@@ -318,7 +308,7 @@ protected:
   asio::awaitable<void> protocol_close() override;
   asio::awaitable<bool> protocol_is_open() override;
   asio::awaitable<int> protocol_send(const char *data, size_t length) override;
-  asio::awaitable<int> protocol_recv(char *buffer, size_t buffer_size) override;
+  asio::awaitable<bool> protocol_recv() override;
 
 private:
   void create_client();
@@ -329,12 +319,6 @@ private:
   
   // HTTP/2 session
   nghttp2_session* session_;
-  
-  // Response ready queue (for protocol_recv to return)
-  // Multiple streams may complete during one nghttp2_session_mem_recv call
-  // Queue stores multiplex_tid of ready responses (data is in pending_request)
-  // Note: No mutex needed - only accessed by recv_loop coroutine and its callbacks
-  std::queue<uint16_t> response_ready_queue_;
   
   // Internal helpers
   asio::awaitable<bool> send_session_data();

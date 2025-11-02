@@ -47,20 +47,7 @@ dns_pool_connections::~dns_pool_connections() {
   common::log.debug("dns_upstream_connections destroyed: %s", data_.uri.c_str());
 }
 
-void dns_pool_connections::create_instances() {
-  // Deprecated: instances are now created during group init
-  // This method is kept for backward compatibility
-  std::lock_guard<std::mutex> lock(mutex_);
-  
-  auto instance = create_single_instance();
-  if (instance) {
-    instances_.push_back(instance);
-  }
-
-  common::log.debug("created instance for %s", data_.uri.c_str());
-}
-
-std::shared_ptr<dns_upstream>
+asio::awaitable<std::shared_ptr<dns_upstream>>
 dns_pool_connections::create_single_instance() {
   std::shared_ptr<dns_upstream> instance;
   
@@ -69,7 +56,7 @@ dns_pool_connections::create_single_instance() {
   
   if (!parsed.is_valid()) {
     common::log.error("failed to parse upstream URI: %s", data_.uri.c_str());
-    return nullptr;
+    co_return nullptr;
   }
   
   // Parse proxy URI if present
@@ -193,10 +180,58 @@ dns_pool_connections::create_single_instance() {
     
     default:
       common::log.error("unsupported URI scheme in: %s", data_.uri.c_str());
-      return nullptr;
+      co_return nullptr;
   }
 
-  return instance;
+  // Try to open the instance with timeout before returning
+  bool opened = co_await open_instance(instance);
+  if (!opened) {
+    co_return nullptr;
+  }
+
+  co_return instance;
+}
+
+asio::awaitable<bool>
+dns_pool_connections::open_instance(std::shared_ptr<dns_upstream> instance) {
+  async_timeout_execute timeout_execute(executor_);
+  
+  try {
+    co_await timeout_execute.execute_until(
+        std::chrono::milliseconds(dns::connect_timeout),
+        [&instance, &timeout_execute](asio::steady_timer &timer) -> asio::awaitable<void> {
+          try {
+            bool result = co_await instance->open();
+            if (!result) {
+              throw std::runtime_error("open() returned false");
+            }
+          } catch (const std::exception &e) {
+            common::log.debug("exception when opening upstream instance: %s", e.what());
+            throw;
+          }
+          
+          // Cancel timer if operation succeeded
+          if (!timeout_execute.timeout()) {
+            timer.cancel();
+          }
+        });
+    
+    // Check if timed out
+    if (timeout_execute.timeout()) {
+      common::log.warning("timeout when opening upstream instance: %s", data_.uri.c_str());
+      instance->close();
+      co_return false;
+    }
+  } catch (const std::exception &e) {
+    common::log.debug("exception when opening upstream instance %s: %s",
+                     data_.uri.c_str(), e.what());
+    if (instance) {
+      instance->close();
+    }
+    co_return false;
+  }
+
+  co_return true;
 }
 
 std::vector<std::shared_ptr<dns_upstream>>
@@ -211,7 +246,10 @@ size_t dns_pool_connections::get_available_count() const {
   for (const auto &instance : instances_) {
     // Multiplexing instances are always available for concurrent requests
     // Non-multiplexing instances (DoT/DoH) are only available if not locked
-    if (instance->supports_multiplexing() || !instance->locked_.load()) {
+    if (instance->supports_multiplexing() || instance->mutex_.try_lock()) {
+      if (!instance->supports_multiplexing()) {
+        instance->mutex_.unlock();  // Release immediately, we just checked
+      }
       count++;
     }
   }
@@ -275,45 +313,23 @@ asio::awaitable<void> dns_pool_group::init() {
 
   // Initialize each connections
   for (auto &connections : connections_to_init) {
-    // Create single instance for this connections
-    auto instance = connections->create_single_instance();
+    // Create single instance for this connections (includes opening with timeout)
+    auto instance = co_await connections->create_single_instance();
     
     if (!instance) {
-      // Failed to create instance
+      // Failed to create or open instance
       connections->status_ = connection_status::offline;
       common::log.error("failed to create instance for connections %s, status: offline",
                         connections->data_.uri.c_str());
       continue;
     }
 
-    // Try to open the upstream
-    bool open_success = false;
-    try {
-      open_success = co_await instance->open();
-    } catch (const std::exception &e) {
-      common::log.error("exception when opening upstream %s: %s",
-                        connections->data_.uri.c_str(), e.what());
-      open_success = false;
-    }
-
-    if (open_success) {
-      // Successfully opened (already validated in upstream->open for TLS/HTTPS)
-      {
-        std::lock_guard<std::mutex> lock(connections->mutex_);
-        connections->instances_.push_back(instance);
-        // Initialize last_check_time
-        connections->last_check_times_[instance] = std::chrono::steady_clock::now();
-      }
-      connections->status_ = connection_status::active;
-      common::log.debug("connections %s initialized successfully, status: active",
-                        connections->data_.uri.c_str());
-    } else {
-      // Failed to open, remove instance and set status to offline
-      // Instance will be automatically destroyed when shared_ptr goes out of scope
-      connections->status_ = connection_status::offline;
-      common::log.warning("failed to open upstream for connections %s, status: offline",
-                          connections->data_.uri.c_str());
-    }
+    // Successfully opened (already validated in upstream->open for TLS/HTTPS)
+    std::lock_guard<std::mutex> lock(connections->mutex_);
+    connections->instances_.push_back(instance);
+    connections->status_ = connection_status::active;
+    common::log.debug("connections %s initialized successfully, status: active",
+                      connections->data_.uri.c_str());
   }
 
   // Balance load after initialization
@@ -413,7 +429,6 @@ asio::awaitable<void> dns_pool_group::scale_down(
         for (size_t i = 0; i < can_remove && !connections->instances_.empty(); ++i) {
           auto instance = connections->instances_.back();
           connections->instances_.pop_back();
-          connections->last_check_times_.erase(instance);
           instances_to_close.push_back(instance);
         }
       }
@@ -483,22 +498,12 @@ asio::awaitable<void> dns_pool_group::rebalance_distribution(
       size_t added = 0;
       
       for (size_t j = 0; j < to_add; ++j) {
-        auto instance = connections->create_single_instance();
+        auto instance = co_await connections->create_single_instance();
         if (!instance) continue;
         
-        bool open_success = false;
-        try {
-          open_success = co_await instance->open();
-        } catch (const std::exception &e) {
-          common::log.debug("exception when opening rebalance upstream: %s", e.what());
-        }
-        
-        if (open_success) {
-          std::lock_guard<std::mutex> lock(connections->mutex_);
-          connections->instances_.push_back(instance);
-          connections->last_check_times_[instance] = std::chrono::steady_clock::now();
-          added++;
-        }
+        std::lock_guard<std::mutex> lock(connections->mutex_);
+        connections->instances_.push_back(instance);
+        added++;
       }
       
       if (added > 0) {
@@ -534,7 +539,6 @@ asio::awaitable<void> dns_pool_group::rebalance_distribution(
         for (size_t j = 0; j < to_remove && !connections->instances_.empty(); ++j) {
           auto instance = connections->instances_.back();
           connections->instances_.pop_back();
-          connections->last_check_times_.erase(instance);
           instances_to_close.push_back(instance);
         }
       }
@@ -589,7 +593,7 @@ asio::awaitable<void> dns_pool_group::scale_up(
 
     // Create and open instances (one-time attempt per instance)
     for (size_t j = 0; j < instances_to_create; ++j) {
-      auto instance = connections->create_single_instance();
+      auto instance = co_await connections->create_single_instance();
       
       if (!instance) {
         failed_count++;
@@ -598,32 +602,12 @@ asio::awaitable<void> dns_pool_group::scale_up(
         continue; // Ignore this instance and move to next
       }
 
-      // Try to open the upstream (one-time attempt)
-      bool open_success = false;
-      try {
-        open_success = co_await instance->open();
-      } catch (const std::exception &e) {
-        common::log.debug("exception when opening additional upstream %s: %s, ignoring",
-                          connections->data_.uri.c_str(), e.what());
-        open_success = false;
+      // Successfully opened, add to instances
+      {
+        std::lock_guard<std::mutex> lock(connections->mutex_);
+        connections->instances_.push_back(instance);
       }
-
-      if (open_success) {
-        // Successfully opened, add to instances
-        {
-          std::lock_guard<std::mutex> lock(connections->mutex_);
-          connections->instances_.push_back(instance);
-          // Initialize last_check_time for the new instance
-          // Give it some time to stabilize before first health check
-          connections->last_check_times_[instance] = std::chrono::steady_clock::now();
-        }
-        created_count++;
-      } else {
-        // Failed to open, ignore this instance (will be destroyed automatically)
-        failed_count++;
-        common::log.debug("failed to open additional instance %zu/%zu for connections %s, ignoring",
-                          j + 1, instances_to_create, connections->data_.uri.c_str());
-      }
+      created_count++;
     }
 
     common::log.debug("connections %s: created %zu/%zu instances (%zu failed/ignored)",
@@ -722,6 +706,7 @@ dns_pool_group::get_next_upstream() {
     std::lock_guard<std::mutex> lock(mutex_);
     
     if (connections_list_.empty()) {
+      missing_count_.fetch_add(1, std::memory_order_relaxed);
       common::log.error("no connections available in group '%s'",
                         name().c_str());
       co_return nullptr;
@@ -738,6 +723,7 @@ dns_pool_group::get_next_upstream() {
     }
     
     if (all_instances.empty()) {
+      missing_count_.fetch_add(1, std::memory_order_relaxed);
       common::log.warning("no available instances in group '%s'",
                           name().c_str());
       co_return nullptr;
@@ -754,12 +740,13 @@ dns_pool_group::get_next_upstream() {
   for (size_t i = 0; i < all_instances.size(); i++) {
     auto &info = all_instances[i];
     
-    // For non-multiplexing instances (DoT/DoH), check if locked (busy)
     // Multiplexing instances (UDP) can handle concurrent requests, no need to check
+    // Non-multiplexing instances (DoT/DoH), check if locked (busy)
+    if (!info.instance->supports_multiplexing() && !info.instance->mutex_.try_lock()) {
+      continue;  // Skip busy instances (DoT/DoH only)
+    }
     if (!info.instance->supports_multiplexing()) {
-      if (info.instance->locked_.load(std::memory_order_acquire)) {
-        continue;  // Skip busy instances (DoT/DoH only)
-      }
+      info.instance->mutex_.unlock();  // Release immediately, we just checked
     }
     
     // Get cumulative request count (never reset)
@@ -774,7 +761,7 @@ dns_pool_group::get_next_upstream() {
   }
   
   // Return the instance with the least requests (if found)
-  // Note: We don't lock here - the lock will be managed by await_coroutine_lock in dns_upstream_request
+  // Note: We don't lock here - the lock will be managed by async_mutex_lock in dns_upstream_request
   if (best_instance) {
     common::log.debug("selected upstream instance %zu/%zu (cumulative_requests=%lu) from group '%s', connections: %s",
                       best_index, all_instances.size(), min_requests, name().c_str(), 
@@ -981,7 +968,6 @@ asio::awaitable<void> dns_pool_group::check_active_connections(
                                connections->instances_.end(), instance);
       if (inst_it != connections->instances_.end()) {
         connections->instances_.erase(inst_it);
-        connections->last_check_times_.erase(instance);
         removed_count++;
       }
       it = instances_to_check.erase(it);
@@ -990,21 +976,19 @@ asio::awaitable<void> dns_pool_group::check_active_connections(
     
     // Perform health check if enabled
     if (instance->check_enabled()) {
-      auto time_since_check = std::chrono::duration_cast<std::chrono::seconds>(
-          now - connections->last_check_times_[instance]).count();
+      // Check time since last request
+      auto last_request = instance->last_request_time();
+      auto time_since_request = std::chrono::duration_cast<std::chrono::seconds>(
+          now - last_request).count();
       
-      // Check if it's time for a health check
-      if (connections->last_check_times_.find(instance) == connections->last_check_times_.end() ||
-          time_since_check >= instance->check_interval()) {
-        
-        // Update last check time
-        connections->last_check_times_[instance] = now;
-        
+      // Perform health check if no request for check_interval seconds
+      if (time_since_request >= instance->check_interval()) {
         // Perform health check using upstream->check() method
         try {
           bool check_passed = co_await instance->check();
           
           if (!check_passed) {
+            co_await instance->close();
             // Health check failed
             // The connection should already be closed by check() on failure
             // It will be removed in the next check cycle
@@ -1057,42 +1041,21 @@ asio::awaitable<void> dns_pool_group::recover_degraded_connections(
                       name().c_str(), connections->data_.uri.c_str(), 
                       connections->attempt_count_);
     
-    auto instance = connections->create_single_instance();
+    auto instance = co_await connections->create_single_instance();
     if (instance) {
-      bool open_success = false;
-      try {
-        open_success = co_await instance->open();
-      } catch (const std::exception &e) {
-        common::log.debug("group '%s': exception when opening degraded upstream %s: %s",
-                          name().c_str(), connections->data_.uri.c_str(), e.what());
+      // Successfully opened (validated in upstream->open for TLS/HTTPS)
+      {
+        std::lock_guard<std::mutex> lock(connections->mutex_);
+        connections->instances_.push_back(instance);
       }
+      connections->status_ = connection_status::active;
+      connections->status_change_time_ = now;
+      connections->attempt_count_ = 0;
+      common::log.info("group '%s': connections %s recovered to active",
+                       name().c_str(), connections->data_.uri.c_str());
       
-      if (open_success) {
-        // Successfully opened (validated in upstream->open for TLS/HTTPS)
-        {
-          std::lock_guard<std::mutex> lock(connections->mutex_);
-          connections->instances_.push_back(instance);
-          // Initialize last_check_time
-          connections->last_check_times_[instance] = now;
-        }
-        connections->status_ = connection_status::active;
-        connections->status_change_time_ = now;
-        connections->attempt_count_ = 0;
-        common::log.info("group '%s': connections %s recovered to active",
-                         name().c_str(), connections->data_.uri.c_str());
-        
-        // Reset cumulative counters for fair competition after recovery
-        reset_all_cumulative_counters();
-      } else {
-        // Check if reached max attempts
-        if (connections->attempt_count_ >= 5) {
-          connections->status_ = connection_status::offline;
-          connections->status_change_time_ = now;
-          connections->attempt_count_ = 0;
-          common::log.warning("group '%s': connections %s switched to offline (5 failed attempts)",
-                              name().c_str(), connections->data_.uri.c_str());
-        }
-      }
+      // Reset cumulative counters for fair competition after recovery
+      reset_all_cumulative_counters();
     } else {
       if (connections->attempt_count_ >= 5) {
         connections->status_ = connection_status::offline;
@@ -1124,33 +1087,21 @@ asio::awaitable<void> dns_pool_group::recover_offline_connections(
                       name().c_str(), connections->data_.uri.c_str(), 
                       connections->attempt_count_);
     
-    auto instance = connections->create_single_instance();
+    auto instance = co_await connections->create_single_instance();
     if (instance) {
-      bool open_success = false;
-      try {
-        open_success = co_await instance->open();
-      } catch (const std::exception &e) {
-        common::log.debug("group '%s': exception when opening offline upstream %s: %s",
-                          name().c_str(), connections->data_.uri.c_str(), e.what());
+      // Successfully opened (validated in upstream->open for TLS/HTTPS)
+      {
+        std::lock_guard<std::mutex> lock(connections->mutex_);
+        connections->instances_.push_back(instance);
       }
+      connections->status_ = connection_status::active;
+      connections->status_change_time_ = now;
+      connections->attempt_count_ = 0;
+      common::log.info("group '%s': connections %s recovered from offline to active",
+                       name().c_str(), connections->data_.uri.c_str());
       
-      if (open_success) {
-        // Successfully opened (validated in upstream->open for TLS/HTTPS)
-        {
-          std::lock_guard<std::mutex> lock(connections->mutex_);
-          connections->instances_.push_back(instance);
-          // Initialize last_check_time
-          connections->last_check_times_[instance] = now;
-        }
-        connections->status_ = connection_status::active;
-        connections->status_change_time_ = now;
-        connections->attempt_count_ = 0;
-        common::log.info("group '%s': connections %s recovered from offline to active",
-                         name().c_str(), connections->data_.uri.c_str());
-        
-        // Reset cumulative counters for fair competition after recovery
-        reset_all_cumulative_counters();
-      }
+      // Reset cumulative counters for fair competition after recovery
+      reset_all_cumulative_counters();
     }
   }
 }

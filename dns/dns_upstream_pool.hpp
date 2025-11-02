@@ -77,22 +77,22 @@ public:
   size_t get_instance_count() const;
   asio::awaitable<void> clear();
   
-  std::shared_ptr<dns_upstream> create_single_instance();
+  asio::awaitable<std::shared_ptr<dns_upstream>> create_single_instance();
   
+private:
+  // Open instance with timeout
+  asio::awaitable<bool> open_instance(std::shared_ptr<dns_upstream> instance);
+  
+public:
   // Monitoring and statistics
   const dns_upstream_data &data() const { return data_; }
   connection_statistics &get_statistics() { return statistics_; }
   const connection_statistics &get_statistics() const { return statistics_; }
 
 private:
-  void create_instances();
-
   asio::any_io_executor executor_;
   std::vector<std::shared_ptr<dns_upstream>> instances_;
   mutable std::mutex mutex_;
-  
-  // Track last check time for each upstream instance
-  std::unordered_map<std::shared_ptr<dns_upstream>, std::chrono::steady_clock::time_point> last_check_times_;
   
   // Performance statistics
   connection_statistics statistics_;

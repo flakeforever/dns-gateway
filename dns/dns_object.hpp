@@ -19,6 +19,7 @@
 #include "operation.hpp"
 #include <algorithm>
 #include <asio.hpp>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -29,6 +30,9 @@ public:
 
   dns_object();
   ~dns_object();
+
+  // Initialize object for a new request (multiplexing support)
+  void init_for_request(asio::any_io_executor executor);
 
   object_type type_;
 
@@ -41,6 +45,12 @@ public:
   uint16_t question_id_;
   std::string question_domain_;
   uint8_t question_type_;
+
+  // multiplexing/support fields (moved from pending_request)
+  uint16_t transaction_id_ = 0;          // Assigned by dns_gateway
+  std::atomic<bool> completed_{false};
+  std::error_code error_code_{};
+  std::shared_ptr<async_event> wakeup_signal_; // Initialized per request
 };
 
 class dns_object_pool {
@@ -54,7 +64,7 @@ private:
   void init_object(int min_pools);
 
   asio::any_io_executor executor_;
-  std::atomic_bool locked_ = false;
+  async_mutex mutex_;
   std::vector<dns_object *> static_objects_;
   std::vector<dns_object *> active_objects_;
 

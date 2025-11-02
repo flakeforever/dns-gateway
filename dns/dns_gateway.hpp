@@ -28,6 +28,7 @@
 #include "property.hpp"
 #include <iostream>
 #include <vector>
+#include <atomic>
 
 namespace dns {
 constexpr int dns_port = 53;
@@ -74,6 +75,9 @@ private:
   asio::awaitable<void>
   dns_upstream_close(std::shared_ptr<dns_upstream> dns_upstream);
 
+  // Allocate unique transaction ID for multiplexing upstreams
+  uint16_t allocate_transaction_id();
+
   asio::any_io_executor executor_;
   uint16_t port_;
   uint16_t monitor_port_;
@@ -92,5 +96,7 @@ private:
   int object_id_;
   
   bool active_;
+
+  std::atomic<uint16_t> next_transaction_id_{1};
 };
 } // namespace dns

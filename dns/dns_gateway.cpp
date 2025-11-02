@@ -91,6 +91,9 @@ asio::awaitable<void> dns_gateway::run_process() {
       dns_object->question_type_ = package.questions_[0]->q_type();
       dns_object->remote_endpoint_ = remote_endpoint_;
 
+      // Assign multiplexing transaction id for upstream usage
+      dns_object->transaction_id_ = allocate_transaction_id();
+
       common::log.debug("request %d %s type %d from %s", dns_object->question_id_,
                    dns_object->question_domain_.c_str(),
                    dns_object->question_type_,
@@ -198,7 +201,7 @@ dns_gateway::handle_dns_static(dns::dns_object *dns_object) {
   std::vector<std::string> static_values;
 
   {
-    await_coroutine_lock lock(executor_, statics_.locked_);
+    async_mutex_lock lock(statics_.mutex_);
     co_await lock.get_lock();
 
     // check domain static
@@ -269,7 +272,7 @@ dns_gateway::handle_create_cache(dns::dns_object *dns_object) {
     co_return false;
   }
 
-  await_coroutine_lock lock(executor_, cache_.locked_);
+  async_mutex_lock lock(cache_.mutex_);
   co_await lock.get_lock();
 
   dns_cache_entry *cache_entry = co_await cache_.get_free_cache();
@@ -295,7 +298,7 @@ dns_gateway::handle_query_cache(dns::dns_object *dns_object) {
   bool status = false;
 
   {
-    await_coroutine_lock lock(executor_, cache_.locked_);
+    async_mutex_lock lock(cache_.mutex_);
     co_await lock.get_lock();
 
     dns_cache_entry *cache_entry = co_await cache_.query_cache(
@@ -414,55 +417,29 @@ dns_gateway::dns_upstream_request(std::shared_ptr<dns_upstream> dns_upstream,
                                   dns::dns_object *dns_object) {
   bool result = false;
 
-  // define a handle for response
-  bool status = false;
-  auto handle_response = [&](std::error_code ec, const char *data,
-                             uint16_t data_length) -> asio::awaitable<void> {
-    if (!ec) {
-      if (data_length > dns::buffer_size) {
-        co_return;
-      }
+  // No per-call handler needed; upstream writes response into dns_object directly
 
-      // update dns cache
-      memcpy(dns_object->buffer_, data, data_length);
-      dns_object->buffer_length_ = data_length;
-
-      status = true;
-    } else {
-      common::log.error("error: %d message: %s", ec.value(), ec.message().c_str());
-      status = false;
-    }
-
-    co_return;
-  };
-
-  await_timeout_execute timeout_execute(executor_);
+  async_timeout_execute timeout_execute(executor_);
   co_await timeout_execute.execute_until(
       std::chrono::milliseconds(dns::coroutine_timeout),
       [&](asio::steady_timer &timer) -> asio::awaitable<void> {
         try {
           // Only use lock for non-multiplexing upstreams (DoT/DoH)
           // Multiplexing upstreams (UDP) support concurrent requests
+          async_mutex_lock lock(dns_upstream->mutex_);
           if (!dns_upstream->supports_multiplexing()) {
-            await_coroutine_lock lock(executor_, dns_upstream->locked_);
             co_await lock.get_lock();
           }
 
           bool status = co_await dns_upstream->is_open();
-          if (!status) {
-            status = co_await dns_upstream->open();
-          }
-
           if (status) {
-            common::log.info("request %d %s type %d to %s:%d",
+            common::log.debug("request %d %s type %d to %s:%d",
                         dns_object->question_id_,
                         dns_object->question_domain_.c_str(),
                         dns_object->question_type_,
                         dns_upstream->host().c_str(), dns_upstream->port());
 
-            result = co_await dns_upstream->send_request(
-                dns_object->buffer_, dns_object->buffer_length_,
-                handle_response);
+            result = co_await dns_upstream->send_request(dns_object);
           } else {
             common::log.error("dns_upstream is closed");
           }
@@ -480,31 +457,22 @@ dns_gateway::dns_upstream_request(std::shared_ptr<dns_upstream> dns_upstream,
 
 asio::awaitable<void>
 dns_gateway::dns_upstream_close(std::shared_ptr<dns_upstream> dns_upstream) {
-  await_timeout_execute timeout_execute(executor_);
-  co_await timeout_execute.execute_until(
-      std::chrono::milliseconds(dns::coroutine_timeout),
-      [&](asio::steady_timer &timer) -> asio::awaitable<void> {
-        try {
-          // Only use lock for non-multiplexing upstreams (DoT/DoH)
-          // Multiplexing upstreams (UDP) can be closed concurrently
-          if (!dns_upstream->supports_multiplexing()) {
-            await_coroutine_lock lock(executor_, dns_upstream->locked_);
-            co_await lock.get_lock();
-          }
+  try {
+    // Only use lock for non-multiplexing upstreams (DoT/DoH)
+    // Multiplexing upstreams (UDP) can be closed concurrently
+    async_mutex_lock lock(dns_upstream->mutex_);
+    if (!dns_upstream->supports_multiplexing()) {
+      co_await lock.get_lock();
+    }
 
-          co_await dns_upstream->close();
-        } catch (const std::exception &e) {
-          common::log.error("close error: %s", e.what());
-        }
-
-        if (!timeout_execute.timeout()) {
-          timer.cancel();
-        }
-      });
+    co_await dns_upstream->close();
+  } catch (const std::exception &e) {
+    common::log.error("close error: %s", e.what());
+  }
 }
 
 asio::awaitable<void> dns_gateway::wait_terminated() {
-  await_wait wait(executor_);
+  async_wait wait(executor_);
   co_await wait.wait_until(std::chrono::milliseconds(10), [&](bool &finished) {
     if (terminated_) {
       finished = true;
@@ -516,5 +484,13 @@ asio::awaitable<int> dns_gateway::do_receive() {
   memset(recv_buffer_, 0, sizeof(recv_buffer_));
   co_return co_await udp_socket_.async_receive_from(
       asio::buffer(recv_buffer_), remote_endpoint_, asio::use_awaitable);
+}
+
+uint16_t dns_gateway::allocate_transaction_id() {
+  uint16_t tid = next_transaction_id_.fetch_add(1, std::memory_order_relaxed);
+  if (tid == 0) {
+    tid = next_transaction_id_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return tid;
 }
 } // namespace dns

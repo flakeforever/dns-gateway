@@ -178,7 +178,6 @@ set(DNS_SOURCES
     dns_upstream.cpp
     dns_upstream_pool.cpp
     dns_utils.cpp
-    operation.cpp
 )
 
 set(COMMON_SOURCES

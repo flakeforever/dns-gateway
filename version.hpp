@@ -14,7 +14,7 @@
 #pragma once
 
 #define PROJECT_NAME "dns-gateway"
-#define PROJECT_VER  "3.1.0"
+#define PROJECT_VER  "3.1.2"
 #define PROJECT_VER_MAJOR "3"
 #define PROJECT_VER_MINOR "1"
-#define PTOJECT_VER_PATCH "0"
+#define PTOJECT_VER_PATCH "2"

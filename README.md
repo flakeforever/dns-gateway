@@ -105,8 +105,8 @@ Single-threaded advantages:
 
 Synchronization approach:
   - std::mutex: Used for protecting connection pool metadata
-  - std::atomic: Used for statistics counters and coroutine locks
-  - await_coroutine_lock: Async lock for upstream instance access
+  - std::atomic: Used for statistics counters
+  - async_mutex_lock: Async lock for upstream instance access and shared resources
   - Most operations are naturally serialized by single-threaded execution
 ```
 

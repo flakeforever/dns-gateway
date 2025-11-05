@@ -371,7 +371,7 @@ asio::awaitable<void> dns_multiplexing_upstream::recv_loop() {
     }
   }
 
-  clear_all_pending_requests();
+  // clear_all_pending_requests();
   common::log.debug("Multiplexing recv_loop terminated");
 }
 
